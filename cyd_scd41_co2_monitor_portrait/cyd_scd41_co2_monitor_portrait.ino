@@ -99,6 +99,18 @@
 #define DEFAULT_TEMP_OFFSET  5.7f      // tuned empirically on this build
 #define DEFAULT_TEMP_F       true
 
+// Backlight PWM. The CYD's on-board MOSFET has a slow turn-off time;
+// at high PWM frequencies (>10 kHz) it never fully switches off
+// between cycles and the duty cycle has no visible effect. 5 kHz
+// gives the MOSFET ~100 us to turn off, which is enough margin on
+// every CYD revision tested. Still well above human flicker threshold
+// (~80 Hz) so dimming looks smooth.
+#define BACKLIGHT_LEDC_CHAN     0
+#define BACKLIGHT_LEDC_FREQ     5000
+#define BACKLIGHT_LEDC_BITS     8
+#define BACKLIGHT_LEDC_MAX      255
+#define DEFAULT_BRIGHTNESS_PCT  100
+
 // Time settings defaults
 #define DEFAULT_TZ_OFFSET_MIN   (-7 * 60)    // UTC-7 (MST/Arizona, no DST)
 #define DEFAULT_USE_24H         false
@@ -262,6 +274,10 @@ const Rect btnAltPlus    = {SCREEN_W - 44,  SET_ROW1_Y + 14, 36, 32};
 const Rect btnTempMinus  = {SCREEN_W - 116, SET_ROW2_Y + 14, 36, 32};
 const Rect btnTempPlus   = {SCREEN_W - 44,  SET_ROW2_Y + 14, 36, 32};
 const Rect btnForceRecal = {12, SET_FRC_Y, SCREEN_W - 24, SET_FRC_H};
+// Brightness toggle in the Settings header (right side, mirroring "< Back" on the left).
+// Sized just wide enough for "100%" with minimal padding so it does not crowd
+// the centered "Settings" title.
+const Rect btnBrightness = {SCREEN_W - 52, 2, 48, SET_HEADER_H - 4};
 const Rect btnWifiTile   = {12, SET_WIFI_Y, SCREEN_W - 24, SET_WIFI_H};
 
 // Time settings
@@ -310,6 +326,7 @@ uint16_t sensorAltitudeM  = DEFAULT_ALTITUDE_M;
 float    tempOffsetC      = DEFAULT_TEMP_OFFSET;
 // (theme is fixed: dark only)
 bool     tempInFahrenheit = DEFAULT_TEMP_F;
+uint8_t  brightnessPct    = DEFAULT_BRIGHTNESS_PCT;
 int16_t  tzOffsetMin      = DEFAULT_TZ_OFFSET_MIN;
 bool     use24hClock      = DEFAULT_USE_24H;
 bool     ntpEnabled       = true;
@@ -560,6 +577,58 @@ void disableOnboardLeds() {
   pinMode(LED_B, OUTPUT); digitalWrite(LED_B, HIGH);
 }
 
+// Backlight is driven via LEDC PWM so brightness is configurable.
+// Note: the CYD's MOSFET driver is marginal at low duty cycles. PWM
+// frequency is set high (20 kHz) to push any flicker out of the
+// visible band, but very low brightness levels may still flicker on
+// some boards. If you observe flicker even at 100% brightness, the
+// cause is almost always the USB power supply / cable, not PWM.
+//
+// The LEDC API changed between ESP32 Arduino core 2.x and 3.x:
+//   2.x: ledcSetup(channel, freq, bits) + ledcAttachPin(pin, channel)
+//        + ledcWrite(channel, duty)
+//   3.x: ledcAttach(pin, freq, bits) + ledcWrite(pin, duty)
+// We auto-detect via the core version macro and use whichever is
+// available so the sketch builds on either.
+void setupBacklight() {
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  bool ok = ledcAttach(BACKLIGHT_PIN, BACKLIGHT_LEDC_FREQ, BACKLIGHT_LEDC_BITS);
+  Serial.printf("Backlight: LEDC v3 attach pin=%d freq=%d bits=%d -> %s\n",
+                BACKLIGHT_PIN, BACKLIGHT_LEDC_FREQ, BACKLIGHT_LEDC_BITS,
+                ok ? "ok" : "FAILED");
+#else
+  double actualFreq = ledcSetup(BACKLIGHT_LEDC_CHAN,
+                                BACKLIGHT_LEDC_FREQ, BACKLIGHT_LEDC_BITS);
+  ledcAttachPin(BACKLIGHT_PIN, BACKLIGHT_LEDC_CHAN);
+  Serial.printf("Backlight: LEDC v2 chan=%d pin=%d req=%d Hz actual=%.1f Hz bits=%d\n",
+                BACKLIGHT_LEDC_CHAN, BACKLIGHT_PIN,
+                BACKLIGHT_LEDC_FREQ, actualFreq, BACKLIGHT_LEDC_BITS);
+#endif
+}
+
+void applyBrightness() {
+  uint32_t duty = ((uint32_t)brightnessPct * BACKLIGHT_LEDC_MAX) / 100;
+  if (duty > BACKLIGHT_LEDC_MAX) duty = BACKLIGHT_LEDC_MAX;
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcWrite(BACKLIGHT_PIN, duty);
+#else
+  ledcWrite(BACKLIGHT_LEDC_CHAN, duty);
+#endif
+  Serial.printf("Backlight: %u%% (duty %lu/%d)\n",
+                (unsigned)brightnessPct, (unsigned long)duty,
+                BACKLIGHT_LEDC_MAX);
+}
+
+void changeBrightness() {
+  // Cycle: 100 -> 75 -> 50 -> 25 -> 100
+  if      (brightnessPct > 75) brightnessPct = 75;
+  else if (brightnessPct > 50) brightnessPct = 50;
+  else if (brightnessPct > 25) brightnessPct = 25;
+  else                          brightnessPct = 100;
+  savePref("bright", brightnessPct);
+  applyBrightness();
+}
+
 // ============================================================
 //                   PREFERENCES (NVS)
 // ============================================================
@@ -570,6 +639,9 @@ void loadPrefs() {
   sensorAltitudeM  = prefs.getUShort("alt",    DEFAULT_ALTITUDE_M);
   tempOffsetC      = prefs.getFloat ("tempoff", DEFAULT_TEMP_OFFSET);
   tempInFahrenheit = prefs.getBool ("tempf",   DEFAULT_TEMP_F);
+  brightnessPct    = prefs.getUChar("bright",  DEFAULT_BRIGHTNESS_PCT);
+  if (brightnessPct > 100) brightnessPct = 100;
+  if (brightnessPct < 10)  brightnessPct = 10;
   baseUptimeSec    = prefs.getUInt ("uptime",  0);
   lastFrcUptimeSec = prefs.getUInt ("frc_at",  0);
   tzOffsetMin      = prefs.getShort("tzmin",   DEFAULT_TZ_OFFSET_MIN);
@@ -595,6 +667,7 @@ void loadPrefs() {
 }
 
 void savePref(const char* key, bool v)     { prefs.begin("co2mon", false); prefs.putBool   (key, v); prefs.end(); }
+void savePref(const char* key, uint8_t v)  { prefs.begin("co2mon", false); prefs.putUChar  (key, v); prefs.end(); }
 void savePref(const char* key, uint16_t v) { prefs.begin("co2mon", false); prefs.putUShort (key, v); prefs.end(); }
 void savePref(const char* key, int16_t v)  { prefs.begin("co2mon", false); prefs.putShort  (key, v); prefs.end(); }
 void savePref(const char* key, uint32_t v) { prefs.begin("co2mon", false); prefs.putUInt   (key, v); prefs.end(); }
@@ -1136,6 +1209,12 @@ void drawSettingsScreen() {
   tft.setTextDatum(MC_DATUM);
   tft.drawString("Settings", SCREEN_W / 2, SET_HEADER_H / 2, 4);
 
+  // Brightness toggle on the right side of the header.
+  // Tap to cycle 100 -> 75 -> 50 -> 25 -> 100.
+  char bbuf[8];
+  snprintf(bbuf, sizeof(bbuf), "%u%%", (unsigned)brightnessPct);
+  drawSmallButton(btnBrightness, bbuf, COLOR_BTN_BG, COLOR_BTN_TEXT, 2);
+
   char buf[24];
   snprintf(buf, sizeof(buf), "%u m", sensorAltitudeM);
   drawAdjusterRow(SET_ROW1_Y, "Altitude", buf, btnAltMinus, btnAltPlus);
@@ -1469,6 +1548,7 @@ void handleTouch() {
     else if (btnAltPlus.contains(x, y))    { changeAltitude(+ALT_STEP); drawSettingsScreen(); }
     else if (btnTempMinus.contains(x, y))  { changeTempOffset(-1); drawSettingsScreen(); }
     else if (btnTempPlus.contains(x, y))   { changeTempOffset(+1); drawSettingsScreen(); }
+    else if (btnBrightness.contains(x, y)) { changeBrightness(); drawSettingsScreen(); }
     else if (btnForceRecal.contains(x, y)) { currentScreen = SCREEN_CONFIRM_CAL; drawConfirmCalScreen(); }
     else if (btnWifiTile.contains(x, y))   { startWifiPortal(); }
   } else if (currentScreen == SCREEN_TIME_SETTINGS) {
@@ -2042,6 +2122,7 @@ void printInfo() {
   Serial.printf("Temp off:    %.1f C  (%.1f F)\n",
                 tempOffsetC, tempOffsetC * 9.0f / 5.0f);
   Serial.printf("Temp unit:   %s\n", tempInFahrenheit ? "F" : "C");
+  Serial.printf("Brightness:  %u%%\n", (unsigned)brightnessPct);
   Serial.printf("Timezone:    UTC%+d:%02d\n", tzOffsetMin / 60, abs(tzOffsetMin) % 60);
   Serial.printf("Clock:       %s\n", use24hClock ? "24h" : "12h");
   Serial.printf("NTP:         %s (%s)\n", ntpEnabled ? "on" : "off", ntpServer.c_str());
@@ -2085,8 +2166,6 @@ void setup() {
   delay(50);
   Serial.println("\n--- CO2 Monitor booting ---");
 
-  pinMode(BACKLIGHT_PIN, OUTPUT);
-  digitalWrite(BACKLIGHT_PIN, HIGH);
   disableOnboardLeds();
 
   loadPrefs();
@@ -2095,6 +2174,14 @@ void setup() {
   tft.init();
   tft.setRotation(0);
   tft.invertDisplay(INVERT_DISPLAY_COLORS);
+
+  // IMPORTANT: must come AFTER tft.init(). TFT_eSPI's init() calls
+  // pinMode/digitalWrite on the TFT_BL pin (configured as 21 in our
+  // User_Setup.h), which would otherwise clobber the LEDC attach
+  // and leave the pin stuck at full brightness regardless of our
+  // ledcWrite() calls.
+  setupBacklight();
+  applyBrightness();   // honor saved level
 
   touchSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
   ts.begin(touchSPI);
