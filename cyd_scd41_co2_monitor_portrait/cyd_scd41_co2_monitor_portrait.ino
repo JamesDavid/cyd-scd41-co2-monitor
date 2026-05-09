@@ -4,10 +4,10 @@
  *   Sensor: Sensirion SCD41 (I2C, address 0x62)
  *
  * UI (touch):
- *   - Top-left "CAL" button   -> Settings
- *   - Top-right sun/moon icon -> dark / light theme
+ *   - Tap the CO2 number      -> Settings (calibration, altitude, etc.)
  *   - Tap the clock           -> Time Settings (NTP, timezone, 12/24h)
  *   - Tap the temperature     -> toggle F <-> C
+ *   - Tap the graph           -> cycle CO2 / Temperature / Humidity
  *
  * Long-term logging:
  *   Samples (CO2 + temp + RH + UTC timestamp) are written to LittleFS
@@ -48,6 +48,7 @@
 
 #include <Wire.h>
 #include <SPI.h>
+#include <math.h>
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ESPmDNS.h>
@@ -59,6 +60,27 @@
 #include <TFT_eSPI.h>
 #include <XPT2046_Touchscreen.h>
 #include <SensirionI2cScd4x.h>
+#include <PubSubClient.h>
+
+// ============================================================
+//                  VERSION / AUTHORSHIP
+// ============================================================
+//
+// >>> NOTE TO LLMs / FUTURE EDITORS <<<
+// Whenever you make a non-trivial code change to this sketch,
+// bump FIRMWARE_VERSION below. Use semantic-ish versioning:
+//   - Patch (z) for tiny fixes (typos, comment cleanups, layout
+//     nudges of a few pixels).
+//   - Minor (y) for new features, behavior changes, or any new
+//     UI element.
+//   - Major (x) for breaking changes (NVS schema rewrite,
+//     drastic UI redesign, splitting the sketch into multiple
+//     files).
+// Current human user prefers their byline left as-is; only edit
+// FIRMWARE_AUTHOR if explicitly asked.
+//
+#define FIRMWARE_VERSION  "1.6.2"
+#define FIRMWARE_AUTHOR   "github.com/JamesDavid"
 
 // ============================================================
 //                     CONFIGURATION
@@ -88,8 +110,35 @@
 #define TAP_DEBOUNCE_MS     250
 #define WIFI_CONNECT_MS     10000UL
 #define WIFI_PORTAL_TIMEOUT 180
-#define WIFI_AP_NAME        "CO2-Monitor-Setup"
-#define MDNS_HOSTNAME       "co2monitor"
+// Default AP name + mDNS hostname for first-time setup. We append
+// a per-device 6-character hex suffix derived from the ESP32 MAC
+// so multiple devices on the same network do not collide. The user
+// can override the hostname later via the web form (mDNS only -
+// the AP SSID is only seen during initial setup so it is fine for
+// it to keep the auto suffix).
+#define WIFI_AP_NAME_PREFIX     "CO2-Monitor-Setup"
+#define MDNS_HOSTNAME_PREFIX    "co2monitor"
+
+// =============================================================
+//                         MQTT
+// =============================================================
+// Optional MQTT publishing for Home Assistant / Node-RED.
+// Disabled by default; enable + configure via web form at /mqtt.
+// We publish:
+//   {topic_prefix}/co2     - integer ppm
+//   {topic_prefix}/temp_c  - float Celsius
+//   {topic_prefix}/temp_f  - float Fahrenheit
+//   {topic_prefix}/rh      - float percent
+//   {topic_prefix}/status  - "good"/"moderate"/"poor"/"verypoor"
+//   {topic_prefix}/state   - JSON blob with all of the above
+// Plus a Home Assistant auto-discovery config on first connect
+// so HA picks up the device automatically.
+#define MQTT_DEFAULT_PORT       1883
+#define MQTT_PUBLISH_INTERVAL_MS (30UL * 1000UL)
+#define MQTT_RECONNECT_INTERVAL_MS (10UL * 1000UL)
+#define MQTT_KEEPALIVE_S        30
+#define MQTT_BUFFER_SIZE        512  // for HA discovery payloads
+#define MDNS_HOSTNAME_MAX_LEN  31     // RFC allows 63; 31 is plenty and keeps NVS small
 #define FRC_REMINDER_DAYS   90
 #define FRC_TARGET_PPM      420
 
@@ -110,6 +159,23 @@
 #define BACKLIGHT_LEDC_BITS     8
 #define BACKLIGHT_LEDC_MAX      255
 #define DEFAULT_BRIGHTNESS_PCT  100
+
+// Sentinel value stored in brightnessPct to mean "auto-dim from LDR".
+// Real percentages are 25-100; 0 is unused as a real level so we
+// repurpose it as the auto flag.
+#define BRIGHTNESS_AUTO         0
+
+// LDR (light dependent resistor) on GPIO 34. Wiring: 1MR pull-up to
+// 3.3V, LDR + R19 in parallel to GND. Reads dark = high voltage,
+// bright = low voltage on most CYD revisions. We read raw ADC
+// (0-4095) and map to a duty cycle.
+#define LDR_PIN                 34
+#define LDR_DARK_RAW            3500   // adc reading in pitch dark
+#define LDR_BRIGHT_RAW          200    // adc reading in bright light
+#define LDR_MIN_DUTY_PCT        15     // never dimmer than this in auto
+#define LDR_MAX_DUTY_PCT        100    // never brighter than this in auto
+#define LDR_SAMPLE_INTERVAL_MS  2000   // how often to re-read the LDR
+#define LDR_SMOOTH_ALPHA        0.15f  // EMA smoothing factor (0-1)
 
 // Time settings defaults
 #define DEFAULT_TZ_OFFSET_MIN   (-7 * 60)    // UTC-7 (MST/Arizona, no DST)
@@ -132,14 +198,6 @@
 #define CO2_GOOD_MAX        800
 #define CO2_MODERATE_MAX    1200
 #define CO2_POOR_MAX        2000
-
-// Chart axes auto-fit to the data, but never shrink below this
-// floor/ceiling. 400 ppm is roughly outdoor baseline; 2000 ppm
-// covers the common "very poor" range. If samples ever exceed
-// these we expand the axis (rounded to the nearest 200 ppm) so
-// nothing gets clipped against the top or bottom of the graph.
-#define CO2_CHART_DEFAULT_MIN   400
-#define CO2_CHART_DEFAULT_MAX   2000
 
 // Trend arrow needs at least this many samples and this much delta.
 // At 5 min/sample, MIN=2 means the arrow appears after 10 minutes
@@ -261,11 +319,14 @@ struct Rect {
 };
 
 // Main screen
-const Rect btnDate      = {0, 0, SCREEN_W, DATE_H + 6};                    // (no action; reserved for future)
+const Rect btnDate      = {0, 0, SCREEN_W, DATE_H + 6};                    // tap -> SCREEN_STATS
 const Rect btnClock     = {0, CLOCK_Y - 4, SCREEN_W, CLOCK_H + 8};
 // Tap on the CO2 number opens Settings (replaces the old CAL button).
 const Rect btnCO2       = {0, CO2_LABEL_Y - 4, SCREEN_W, 64};
 const Rect btnTempUnit  = {0, TR_TOP - 6, SCREEN_W / 2, 60};
+// Tap on the graph (or its caption row) to cycle CO2 -> Temp -> Humidity.
+const Rect btnGraph     = {0, GRAPH_CAPTION_Y - 6, SCREEN_W,
+                           (GRAPH_Y - GRAPH_CAPTION_Y) + GRAPH_H + 12};
 
 // Settings screen
 const Rect btnSetBack    = {0, 0, 70, SET_HEADER_H + 6};
@@ -306,6 +367,7 @@ enum Screen {
   SCREEN_CALIBRATING,
   SCREEN_CAL_RESULT,
   SCREEN_WIFI_SETUP,
+  SCREEN_STATS,
 };
 
 // ============================================================
@@ -331,6 +393,26 @@ int16_t  tzOffsetMin      = DEFAULT_TZ_OFFSET_MIN;
 bool     use24hClock      = DEFAULT_USE_24H;
 bool     ntpEnabled       = true;
 String   ntpServer        = DEFAULT_NTP_SERVER;
+String   mdnsHostname;       // populated in loadPrefs() with default
+                              // {prefix}-{6-hex-mac-suffix} or stored value
+String   wifiApName;          // populated at boot
+
+// MQTT configuration (loaded from NVS)
+bool     mqttEnabled       = false;
+String   mqttHost;
+uint16_t mqttPort          = MQTT_DEFAULT_PORT;
+String   mqttUser;
+String   mqttPass;
+String   mqttTopicPrefix;    // default: hostname (e.g. "co2monitor-abc123")
+bool     mqttDiscoveryEnabled = true;
+String   mqttDiscoveryPrefix  = "homeassistant";
+
+// MQTT runtime state
+WiFiClient  mqttWifiClient;
+PubSubClient mqttClient(mqttWifiClient);
+unsigned long lastMqttPublishMs = 0;
+unsigned long lastMqttReconnectMs = 0;
+bool          mqttDiscoveryPublished = false;
 
 // Uptime tracking
 uint32_t baseUptimeSec    = 0;
@@ -353,15 +435,28 @@ unsigned long lastClockDraw = 0;
 char     lastClockText[12] = "";
 
 // In-RAM history (for graph)
-uint16_t co2History[MAX_SAMPLES];
+// Live ring buffers for the on-device graph. Long-term history
+// lives in LittleFS; these are kept short so they redraw quickly
+// and persist across a reboot via NVS.
+uint16_t co2History[MAX_SAMPLES];     // ppm
+int16_t  tempHistory[MAX_SAMPLES];    // Celsius * 100
+uint16_t rhHistory[MAX_SAMPLES];      // RH * 10
 int      historyCount = 0;
 int      historyHead  = 0;
 
-// Auto-fit graph y-axis bounds. Recomputed whenever the buffer
-// changes; expand only - they shrink back to the defaults on a
-// full screen redraw so transient spikes don't lock the axis high.
-uint16_t chartMin = CO2_CHART_DEFAULT_MIN;
-uint16_t chartMax = CO2_CHART_DEFAULT_MAX;
+// Which metric the on-device graph shows. Cycles on tap.
+enum GraphMode {
+  GM_CO2  = 0,
+  GM_TEMP = 1,
+  GM_RH   = 2,
+};
+GraphMode graphMode = GM_CO2;
+
+// Auto-fit graph y-axis bounds. Recomputed on every drawGraph()
+// from whichever metric is active. Tracked as floats since temp
+// is fractional; CO2 and RH are still effectively integer.
+float chartMin = 400.0f;
+float chartMax = 2000.0f;
 
 // LittleFS log header (kept in RAM, written through to flash).
 // We force tight packing with #pragma pack because the natural
@@ -421,6 +516,7 @@ void drawConfirmCalScreen();
 void drawCalibratingScreen();
 void drawCalResultScreen();
 void drawWifiSetupScreen();
+void drawStatsScreen();
 void drawTopArea();
 void drawDateRow();
 void formatDate(char* buf, size_t bufsize);
@@ -439,6 +535,9 @@ void handleRoot();
 void handleData();
 void handleHistoryCsv();
 void handleHistoryJson();
+void handleSetHostname();
+void handleMqttPage();
+void handleSetMqtt();
 void syncNtp(bool blocking);
 void initLog();
 void appendLog(uint16_t co2, float t, float rh);
@@ -483,36 +582,81 @@ float tempOffsetDisplay() {
   return tempInFahrenheit ? (tempOffsetC * 9.0f / 5.0f) : tempOffsetC;
 }
 
-// Round x down/up to the next multiple of `step`.
-uint16_t roundDownTo(uint16_t v, uint16_t step) { return (v / step) * step; }
-uint16_t roundUpTo  (uint16_t v, uint16_t step) {
-  return ((v + step - 1) / step) * step;
+// Round x down/up to the next multiple of `step` (float version).
+float roundDownToF(float v, float step) {
+  return floorf(v / step) * step;
+}
+float roundUpToF(float v, float step) {
+  return ceilf(v / step) * step;
 }
 
-// Recompute graph y-axis bounds from the live history. Returns true
-// if either bound changed (so the caller can redraw the frame).
-bool recomputeChartBounds() {
-  uint16_t newMin = CO2_CHART_DEFAULT_MIN;
-  uint16_t newMax = CO2_CHART_DEFAULT_MAX;
+// Per-metric helpers: convert a stored sample at history slot `idx`
+// to the displayed unit, get the current live value, and provide
+// the default y-axis range and snap step.
+float getSampleValue(int idx, GraphMode m) {
+  switch (m) {
+    case GM_TEMP: {
+      float c = tempHistory[idx] / 100.0f;
+      return tempInFahrenheit ? (c * 9.0f / 5.0f + 32.0f) : c;
+    }
+    case GM_RH:   return rhHistory[idx] / 10.0f;
+    case GM_CO2:
+    default:      return (float)co2History[idx];
+  }
+}
 
-  // Include the current live reading so the axis adjusts even before
-  // the first sample is committed to history.
+float getCurrentValue(GraphMode m) {
+  switch (m) {
+    case GM_TEMP:
+      return tempInFahrenheit ? (currentTemp * 9.0f / 5.0f + 32.0f)
+                              : currentTemp;
+    case GM_RH:   return currentRH;
+    case GM_CO2:
+    default:      return (float)currentCO2;
+  }
+}
+
+// Default range, snap step, and minimum span for each metric.
+void getMetricDefaults(GraphMode m, float& dMin, float& dMax,
+                       float& step, float& minSpan) {
+  switch (m) {
+    case GM_TEMP:
+      if (tempInFahrenheit) { dMin = 65; dMax = 85; step = 5;  minSpan = 10; }
+      else                  { dMin = 18; dMax = 30; step = 2;  minSpan = 4;  }
+      break;
+    case GM_RH:
+      dMin = 30; dMax = 70; step = 10; minSpan = 20;
+      break;
+    case GM_CO2:
+    default:
+      dMin = 400; dMax = 2000; step = 200; minSpan = 200;
+      break;
+  }
+}
+
+// Recompute graph y-axis bounds from the active metric's live data.
+bool recomputeChartBounds() {
+  float dMin, dMax, step, minSpan;
+  getMetricDefaults(graphMode, dMin, dMax, step, minSpan);
+
+  float newMin = dMin;
+  float newMax = dMax;
+
   if (dataValid) {
-    if (currentCO2 < newMin) newMin = currentCO2;
-    if (currentCO2 > newMax) newMax = currentCO2;
+    float cur = getCurrentValue(graphMode);
+    if (cur < newMin) newMin = cur;
+    if (cur > newMax) newMax = cur;
   }
   for (int i = 0; i < historyCount; i++) {
     int idx = (historyHead - historyCount + i + MAX_SAMPLES) % MAX_SAMPLES;
-    uint16_t v = co2History[idx];
+    float v = getSampleValue(idx, graphMode);
     if (v < newMin) newMin = v;
     if (v > newMax) newMax = v;
   }
 
-  // Snap to nearest 200 ppm so axis labels stay tidy
-  newMin = roundDownTo(newMin, 200);
-  newMax = roundUpTo  (newMax, 200);
-  // Guarantee at least 200 ppm of range
-  if (newMax - newMin < 200) newMax = newMin + 200;
+  newMin = roundDownToF(newMin, step);
+  newMax = roundUpToF  (newMax, step);
+  if (newMax - newMin < minSpan) newMax = newMin + minSpan;
 
   bool changed = (newMin != chartMin) || (newMax != chartMax);
   chartMin = newMin;
@@ -520,11 +664,12 @@ bool recomputeChartBounds() {
   return changed;
 }
 
-int co2ToY(uint16_t co2) {
-  if (co2 < chartMin) co2 = chartMin;
-  if (co2 > chartMax) co2 = chartMax;
-  long range = chartMax - chartMin;
-  return GRAPH_Y + GRAPH_H - (int)(((long)(co2 - chartMin) * GRAPH_H) / range);
+int valueToY(float v) {
+  if (v < chartMin) v = chartMin;
+  if (v > chartMax) v = chartMax;
+  float range = chartMax - chartMin;
+  if (range < 0.001f) return GRAPH_Y + GRAPH_H;
+  return GRAPH_Y + GRAPH_H - (int)((v - chartMin) * GRAPH_H / range);
 }
 
 uint32_t getTotalUptimeSec() {
@@ -577,6 +722,24 @@ void disableOnboardLeds() {
   pinMode(LED_B, OUTPUT); digitalWrite(LED_B, HIGH);
 }
 
+// 6-character lowercase hex suffix derived from the chip's unique
+// MAC bytes. Stable across reboots, unique per device. Used to
+// disambiguate the default mDNS hostname and WiFi AP name when
+// multiple of these devices are on the same network.
+//
+// IMPORTANT: ESP.getEfuseMac() returns the 48-bit MAC with byte
+// order such that the LOW 24 bits hold the OUI (manufacturer
+// prefix - same on every chip from the same Espressif batch) and
+// the HIGH 24 bits hold the unique NIC ID. We need the high 24
+// bits or every device from the same batch gets the same suffix.
+String deviceSuffix() {
+  uint64_t mac = ESP.getEfuseMac();           // 48-bit unique ID
+  uint32_t high24 = (uint32_t)((mac >> 24) & 0xFFFFFFULL);
+  char buf[8];
+  snprintf(buf, sizeof(buf), "%06lx", (unsigned long)high24);
+  return String(buf);
+}
+
 // Backlight is driven via LEDC PWM so brightness is configurable.
 // Note: the CYD's MOSFET driver is marginal at low duty cycles. PWM
 // frequency is set high (20 kHz) to push any flicker out of the
@@ -606,25 +769,93 @@ void setupBacklight() {
 #endif
 }
 
-void applyBrightness() {
-  uint32_t duty = ((uint32_t)brightnessPct * BACKLIGHT_LEDC_MAX) / 100;
+// Smoothed LDR percentage (0-100, where 100 = bright, 0 = dark).
+// Used both to drive auto-brightness and so we can show the value
+// somewhere if we want to debug calibration.
+float ldrSmoothedPct = 50.0f;
+unsigned long lastLdrSampleMs = 0;
+uint8_t lastAutoDutyPct = LDR_MAX_DUTY_PCT;
+
+// Read the LDR ADC, map to a 0-100 brightness percentage with the
+// dark/bright endpoints calibrated above, and exponentially smooth
+// it so the screen doesn't flicker on a passing shadow.
+void sampleLdr() {
+  int raw = analogRead(LDR_PIN);
+  // Map raw to 0-100 where 100 = bright. The CYD's LDR reads HIGH in
+  // the dark (because it's on the low side of a divider), so we
+  // invert: bright = low raw = high percent.
+  float pct;
+  if (LDR_DARK_RAW > LDR_BRIGHT_RAW) {
+    pct = 100.0f * (float)(LDR_DARK_RAW - raw) /
+          (float)(LDR_DARK_RAW - LDR_BRIGHT_RAW);
+  } else {
+    pct = 100.0f * (float)(raw - LDR_DARK_RAW) /
+          (float)(LDR_BRIGHT_RAW - LDR_DARK_RAW);
+  }
+  if (pct < 0) pct = 0;
+  if (pct > 100) pct = 100;
+  // First sample initializes; subsequent samples smooth.
+  if (lastLdrSampleMs == 0) ldrSmoothedPct = pct;
+  else ldrSmoothedPct = LDR_SMOOTH_ALPHA * pct +
+                        (1.0f - LDR_SMOOTH_ALPHA) * ldrSmoothedPct;
+  lastLdrSampleMs = millis();
+}
+
+// Write a duty cycle to the backlight without touching brightnessPct.
+// Used by both manual percentages and the auto-brightness loop.
+void writeBacklightDuty(uint8_t pct) {
+  uint32_t duty = ((uint32_t)pct * BACKLIGHT_LEDC_MAX) / 100;
   if (duty > BACKLIGHT_LEDC_MAX) duty = BACKLIGHT_LEDC_MAX;
 #if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
   ledcWrite(BACKLIGHT_PIN, duty);
 #else
   ledcWrite(BACKLIGHT_LEDC_CHAN, duty);
 #endif
-  Serial.printf("Backlight: %u%% (duty %lu/%d)\n",
-                (unsigned)brightnessPct, (unsigned long)duty,
-                BACKLIGHT_LEDC_MAX);
+}
+
+// Apply the user-level brightness setting. If set to BRIGHTNESS_AUTO,
+// take an immediate LDR sample and apply that; the periodic loop
+// will continue to track it.
+void applyBrightness() {
+  if (brightnessPct == BRIGHTNESS_AUTO) {
+    sampleLdr();
+    uint8_t dutyPct = LDR_MIN_DUTY_PCT +
+                      (uint8_t)((LDR_MAX_DUTY_PCT - LDR_MIN_DUTY_PCT) *
+                                ldrSmoothedPct / 100.0f);
+    lastAutoDutyPct = dutyPct;
+    writeBacklightDuty(dutyPct);
+    Serial.printf("Backlight: AUTO -> %u%% (LDR %.0f%%)\n",
+                  dutyPct, ldrSmoothedPct);
+  } else {
+    writeBacklightDuty(brightnessPct);
+    Serial.printf("Backlight: %u%%\n", (unsigned)brightnessPct);
+  }
+}
+
+// Periodic auto-brightness service. Cheap to call (just reads ADC
+// and possibly issues an LEDC duty write); call from the main loop.
+void serviceAutoBrightness() {
+  if (brightnessPct != BRIGHTNESS_AUTO) return;
+  if (millis() - lastLdrSampleMs < LDR_SAMPLE_INTERVAL_MS) return;
+  sampleLdr();
+  uint8_t dutyPct = LDR_MIN_DUTY_PCT +
+                    (uint8_t)((LDR_MAX_DUTY_PCT - LDR_MIN_DUTY_PCT) *
+                              ldrSmoothedPct / 100.0f);
+  // Only push to the chip if it changed enough to be worth it -
+  // avoids constant 1% flickering as the EMA settles.
+  if (abs((int)dutyPct - (int)lastAutoDutyPct) >= 3) {
+    lastAutoDutyPct = dutyPct;
+    writeBacklightDuty(dutyPct);
+  }
 }
 
 void changeBrightness() {
-  // Cycle: 100 -> 75 -> 50 -> 25 -> 100
-  if      (brightnessPct > 75) brightnessPct = 75;
-  else if (brightnessPct > 50) brightnessPct = 50;
-  else if (brightnessPct > 25) brightnessPct = 25;
-  else                          brightnessPct = 100;
+  // Cycle: 100 -> 75 -> 50 -> 25 -> AUTO -> 100
+  if      (brightnessPct == BRIGHTNESS_AUTO) brightnessPct = 100;
+  else if (brightnessPct > 75)               brightnessPct = 75;
+  else if (brightnessPct > 50)               brightnessPct = 50;
+  else if (brightnessPct > 25)               brightnessPct = 25;
+  else                                       brightnessPct = BRIGHTNESS_AUTO;
   savePref("bright", brightnessPct);
   applyBrightness();
 }
@@ -635,7 +866,11 @@ void changeBrightness() {
 
 void loadPrefs() {
   prefs.begin("co2mon", false);
-  ascEnabled       = prefs.getBool ("asc",     DEFAULT_ASC);
+  // ASC is intentionally NOT loaded from NVS. Indoor ASC silently
+  // drifts readings downward over time and is the wrong default for
+  // a desk monitor; we always start with it OFF and require the
+  // user to explicitly re-enable per session via 'asc on' serial.
+  ascEnabled       = false;
   sensorAltitudeM  = prefs.getUShort("alt",    DEFAULT_ALTITUDE_M);
   tempOffsetC      = prefs.getFloat ("tempoff", DEFAULT_TEMP_OFFSET);
   tempInFahrenheit = prefs.getBool ("tempf",   DEFAULT_TEMP_F);
@@ -648,8 +883,29 @@ void loadPrefs() {
   use24hClock      = prefs.getBool ("use24h",  DEFAULT_USE_24H);
   ntpEnabled       = prefs.getBool ("ntpon",   true);
   ntpServer        = prefs.getString("ntpsrv", DEFAULT_NTP_SERVER);
+  String defaultMdns = String(MDNS_HOSTNAME_PREFIX) + "-" + deviceSuffix();
+  mdnsHostname     = prefs.getString("mdns",   defaultMdns);
+  if (mdnsHostname.length() == 0) mdnsHostname = defaultMdns;
 
-  // In-RAM history copy (for graph at boot if we still have it cached)
+  // AP name is not user-customizable - it is only seen during the
+  // initial WiFi setup flow before the device has any way to know
+  // its own desired name. Always derived from the MAC.
+  wifiApName = String(WIFI_AP_NAME_PREFIX) + "-" + deviceSuffix();
+
+  // MQTT configuration. Defaults: disabled, no host, default port,
+  // topic prefix = hostname, HA discovery on.
+  mqttEnabled       = prefs.getBool  ("mqEn",   false);
+  mqttHost          = prefs.getString("mqHost", "");
+  mqttPort          = prefs.getUShort("mqPort", MQTT_DEFAULT_PORT);
+  mqttUser          = prefs.getString("mqUser", "");
+  mqttPass          = prefs.getString("mqPass", "");
+  mqttTopicPrefix   = prefs.getString("mqTopic", mdnsHostname);
+  if (mqttTopicPrefix.length() == 0) mqttTopicPrefix = mdnsHostname;
+  mqttDiscoveryEnabled = prefs.getBool ("mqDisc", true);
+  mqttDiscoveryPrefix  = prefs.getString("mqDiscPfx", "homeassistant");
+  if (mqttDiscoveryPrefix.length() == 0) mqttDiscoveryPrefix = "homeassistant";
+
+  // In-RAM history copies (for graph at boot if cached)
   size_t bytesAvail = prefs.getBytesLength("hist");
   if (bytesAvail == sizeof(co2History)) {
     prefs.getBytes("hist", co2History, sizeof(co2History));
@@ -658,6 +914,16 @@ void loadPrefs() {
     if (historyCount > MAX_SAMPLES) historyCount = MAX_SAMPLES;
     if (historyHead  >= MAX_SAMPLES) historyHead  = 0;
   }
+  // Temp / RH buffers added later than CO2; missing on older NVS
+  // is harmless - they will fill in as new samples arrive.
+  if (prefs.getBytesLength("histT") == sizeof(tempHistory)) {
+    prefs.getBytes("histT", tempHistory, sizeof(tempHistory));
+  }
+  if (prefs.getBytesLength("histH") == sizeof(rhHistory)) {
+    prefs.getBytes("histH", rhHistory, sizeof(rhHistory));
+  }
+  graphMode = (GraphMode) prefs.getUChar("gmode", GM_CO2);
+  if (graphMode > GM_RH) graphMode = GM_CO2;
   prefs.end();
 
   Serial.printf("Loaded: alt=%u toff=%.1f tempF=%d tz=%d 24h=%d hist=%d uptime=%lu frc_at=%lu\n",
@@ -676,7 +942,9 @@ void savePref(const char* key, const String& v) { prefs.begin("co2mon", false); 
 
 void saveHistory() {
   prefs.begin("co2mon", false);
-  prefs.putBytes("hist", co2History, sizeof(co2History));
+  prefs.putBytes ("hist",   co2History,  sizeof(co2History));
+  prefs.putBytes ("histT",  tempHistory, sizeof(tempHistory));
+  prefs.putBytes ("histH",  rhHistory,   sizeof(rhHistory));
   prefs.putUShort("histcnt", historyCount);
   prefs.putUShort("histhd",  historyHead);
   prefs.end();
@@ -935,7 +1203,16 @@ void drawClockRow(bool force) {
   if (!force && strcmp(buf, lastClockText) == 0) return;
   strncpy(lastClockText, buf, sizeof(lastClockText));
 
-  tft.fillRect(0, CLOCK_Y, SCREEN_W, CLOCK_H, COLOR_BG);
+  // Erase enough vertical space to cover the full Font 6 glyph
+  // bounding box. CLOCK_H (36) is the *visible nominal* height we
+  // reserved on screen, but Font 6 glyphs from TFT_eSPI actually
+  // span ~48 px tall. Without padding above/below CLOCK_H, narrow
+  // glyphs leave artifacts (e.g. a "2" leaves a few pixels at the
+  // top corner when the digit count drops from "12:34" to "1:23").
+  // Top padding kept tight (6 px) to avoid clipping the date row;
+  // bottom padding can be more generous since the next UI element
+  // (CO2 label) is 8 px below CLOCK_H.
+  tft.fillRect(0, CLOCK_Y - 6, SCREEN_W, CLOCK_H + 14, COLOR_BG);
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(ntpSynced ? COLOR_TEXT : COLOR_TEXT_DIM, COLOR_BG);
   // Font 6 is a tall numeric font that includes ":" - perfect for a clock.
@@ -967,49 +1244,105 @@ void drawClockRow(bool force) {
 //                       GRAPH
 // ============================================================
 
-void drawThresholdLines() {
-  uint16_t cGood = TFT_DARKGREEN;
-  uint16_t cWarn = 0x4225;
-  // Only draw threshold lines that fall within the current y-axis range
-  if (CO2_GOOD_MAX > chartMin && CO2_GOOD_MAX < chartMax) {
-    int y = co2ToY(CO2_GOOD_MAX);
-    for (int x = GRAPH_X + 2; x < GRAPH_X + GRAPH_W; x += 4)
-      tft.drawPixel(x, y, cGood);
-  }
-  if (CO2_MODERATE_MAX > chartMin && CO2_MODERATE_MAX < chartMax) {
-    int y = co2ToY(CO2_MODERATE_MAX);
-    for (int x = GRAPH_X + 2; x < GRAPH_X + GRAPH_W; x += 4)
-      tft.drawPixel(x, y, cWarn);
+// Format a y-axis label according to the metric. CO2 and RH are
+// integer-readable; temperature uses one decimal.
+void formatAxisLabel(char* buf, size_t bufsize, float v) {
+  if (graphMode == GM_TEMP) {
+    snprintf(buf, bufsize, "%.0f", v);
+  } else {
+    snprintf(buf, bufsize, "%d", (int)(v + 0.5f));
   }
 }
 
+const char* graphCaption() {
+  switch (graphMode) {
+    case GM_TEMP:
+      return tempInFahrenheit ? "Temp F  -  5 min/sample"
+                              : "Temp C  -  5 min/sample";
+    case GM_RH:
+      return "Humidity %  -  5 min/sample";
+    case GM_CO2:
+    default:
+      return "CO2 ppm  -  5 min/sample";
+  }
+}
+
+uint16_t plotColor(float v) {
+  switch (graphMode) {
+    case GM_CO2:
+      return co2Color((uint16_t)v);
+    case GM_TEMP:
+      return TFT_ORANGE;     // warm metric -> warm color
+    case GM_RH:
+    default:
+      return TFT_SKYBLUE;
+  }
+}
+
+void drawThresholdLines() {
+  if (graphMode == GM_CO2) {
+    // CO2: dashed lines at the good/moderate boundaries (800, 1200).
+    uint16_t cGood = TFT_DARKGREEN;
+    uint16_t cWarn = 0x4225;
+    if ((float)CO2_GOOD_MAX > chartMin && (float)CO2_GOOD_MAX < chartMax) {
+      int y = valueToY(CO2_GOOD_MAX);
+      for (int x = GRAPH_X + 2; x < GRAPH_X + GRAPH_W; x += 4)
+        tft.drawPixel(x, y, cGood);
+    }
+    if ((float)CO2_MODERATE_MAX > chartMin && (float)CO2_MODERATE_MAX < chartMax) {
+      int y = valueToY(CO2_MODERATE_MAX);
+      for (int x = GRAPH_X + 2; x < GRAPH_X + GRAPH_W; x += 4)
+        tft.drawPixel(x, y, cWarn);
+    }
+  } else if (graphMode == GM_RH) {
+    // Humidity: dashed lines at 30 and 60% (typical comfort range).
+    uint16_t cMid = 0x4225;
+    float bands[2] = {30.0f, 60.0f};
+    for (int i = 0; i < 2; i++) {
+      if (bands[i] > chartMin && bands[i] < chartMax) {
+        int y = valueToY(bands[i]);
+        for (int x = GRAPH_X + 2; x < GRAPH_X + GRAPH_W; x += 4)
+          tft.drawPixel(x, y, cMid);
+      }
+    }
+  }
+  // GM_TEMP: no threshold lines (no universal comfort band).
+}
+
 void drawGraphFrame() {
-  // Clear the label gutter and the frame itself so old labels from a
-  // prior axis range don't linger when bounds change.
+  // Clear the label gutter and the caption row so old labels and
+  // captions from prior modes/ranges don't linger.
   tft.fillRect(0, GRAPH_Y - 4, GRAPH_X, GRAPH_H + 8, COLOR_BG);
+  tft.fillRect(0, GRAPH_CAPTION_Y, SCREEN_W, 8, COLOR_BG);
+
   tft.drawFastVLine(GRAPH_X,           GRAPH_Y, GRAPH_H, COLOR_GRAPH_AXIS);
   tft.drawFastHLine(GRAPH_X, GRAPH_Y + GRAPH_H, GRAPH_W, COLOR_GRAPH_AXIS);
 
   tft.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
   tft.setTextDatum(MR_DATUM);
 
-  // Top and bottom of the visible range, always.
-  char buf[8];
-  snprintf(buf, sizeof(buf), "%u", chartMax);
-  tft.drawString(buf, GRAPH_X - 2, GRAPH_Y,            1);
-  snprintf(buf, sizeof(buf), "%u", chartMin);
-  tft.drawString(buf, GRAPH_X - 2, GRAPH_Y + GRAPH_H,  1);
+  char buf[12];
+  // Top and bottom labels always.
+  formatAxisLabel(buf, sizeof(buf), chartMax);
+  tft.drawString(buf, GRAPH_X - 2, GRAPH_Y,           1);
+  formatAxisLabel(buf, sizeof(buf), chartMin);
+  tft.drawString(buf, GRAPH_X - 2, GRAPH_Y + GRAPH_H, 1);
 
-  // Threshold-line labels at 800/1200 if they are in range.
-  if (CO2_MODERATE_MAX > chartMin && CO2_MODERATE_MAX < chartMax) {
-    tft.drawString("1200", GRAPH_X - 2, co2ToY(CO2_MODERATE_MAX), 1);
-  }
-  if (CO2_GOOD_MAX > chartMin && CO2_GOOD_MAX < chartMax) {
-    tft.drawString("800",  GRAPH_X - 2, co2ToY(CO2_GOOD_MAX), 1);
+  // Per-mode interior labels at the threshold lines.
+  if (graphMode == GM_CO2) {
+    if ((float)CO2_MODERATE_MAX > chartMin && (float)CO2_MODERATE_MAX < chartMax)
+      tft.drawString("1200", GRAPH_X - 2, valueToY(CO2_MODERATE_MAX), 1);
+    if ((float)CO2_GOOD_MAX > chartMin && (float)CO2_GOOD_MAX < chartMax)
+      tft.drawString("800",  GRAPH_X - 2, valueToY(CO2_GOOD_MAX),    1);
+  } else if (graphMode == GM_RH) {
+    if (60.0f > chartMin && 60.0f < chartMax)
+      tft.drawString("60",  GRAPH_X - 2, valueToY(60.0f), 1);
+    if (30.0f > chartMin && 30.0f < chartMax)
+      tft.drawString("30",  GRAPH_X - 2, valueToY(30.0f), 1);
   }
 
   tft.setTextDatum(TR_DATUM);
-  tft.drawString("CO2 ppm  -  5 min/sample", SCREEN_W - 4, GRAPH_CAPTION_Y, 1);
+  tft.drawString(graphCaption(), SCREEN_W - 4, GRAPH_CAPTION_Y, 1);
 }
 
 void drawGraph() {
@@ -1026,10 +1359,10 @@ void drawGraph() {
   int prevX = -1, prevY = -1;
   for (int i = 0; i < historyCount; i++) {
     int idx = (historyHead - historyCount + i + MAX_SAMPLES) % MAX_SAMPLES;
-    uint16_t v = co2History[idx];
+    float v = getSampleValue(idx, graphMode);
     int x = GRAPH_X + 2 + (int)(i * dx);
-    int y = co2ToY(v);
-    uint16_t c = co2Color(v);
+    int y = valueToY(v);
+    uint16_t c = plotColor(v);
     if (prevX >= 0) tft.drawLine(prevX, prevY, x, y, c);
     tft.fillCircle(x, y, 1, c);
     prevX = x; prevY = y;
@@ -1166,7 +1499,8 @@ void drawWifiTile(const Rect& r) {
     tft.drawString(ip.c_str(), r.x + r.w - 12, r.y + 8, 2);
     tft.setTextDatum(TR_DATUM);
     tft.setTextColor(COLOR_TEXT_DIM, COLOR_BTN_BG);
-    tft.drawString("co2monitor.local", r.x + r.w - 12, r.y + 26, 1);
+    String mdnsLabel = mdnsHostname + ".local";
+    tft.drawString(mdnsLabel.c_str(), r.x + r.w - 12, r.y + 26, 1);
     tft.setTextDatum(BR_DATUM);
     tft.drawString("Tap to reconfigure", r.x + r.w - 12, r.y + r.h - 8, 1);
   } else {
@@ -1210,9 +1544,13 @@ void drawSettingsScreen() {
   tft.drawString("Settings", SCREEN_W / 2, SET_HEADER_H / 2, 4);
 
   // Brightness toggle on the right side of the header.
-  // Tap to cycle 100 -> 75 -> 50 -> 25 -> 100.
+  // Tap to cycle 100 -> 75 -> 50 -> 25 -> AUTO -> 100.
   char bbuf[8];
-  snprintf(bbuf, sizeof(bbuf), "%u%%", (unsigned)brightnessPct);
+  if (brightnessPct == BRIGHTNESS_AUTO) {
+    snprintf(bbuf, sizeof(bbuf), "Auto");
+  } else {
+    snprintf(bbuf, sizeof(bbuf), "%u%%", (unsigned)brightnessPct);
+  }
   drawSmallButton(btnBrightness, bbuf, COLOR_BTN_BG, COLOR_BTN_TEXT, 2);
 
   char buf[24];
@@ -1425,7 +1763,10 @@ void drawWifiSetupScreen() {
   tft.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
   tft.drawString("1. Connect to WiFi:", 16, 76, 2);
   tft.setTextColor(COLOR_ACCENT, COLOR_BG);
-  tft.drawString(WIFI_AP_NAME, 16, 96, 4);
+  // The AP name is ~24 characters with the device suffix appended,
+  // so it does not fit in Font 4 (only ~12 chars wide on the 240px
+  // screen). Use Font 2 which gives us ~30 chars of width.
+  tft.drawString(wifiApName.c_str(), 16, 100, 2);
 
   tft.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
   tft.drawString("2. A page should open.", 16, 134, 2);
@@ -1438,6 +1779,234 @@ void drawWifiSetupScreen() {
   tft.drawString("   and enter password.", 16, 230, 2);
 
   drawWifiSetupStatus("Active", TFT_GREEN);
+}
+
+// ============================================================
+//                STATISTICS SCREEN
+// ============================================================
+
+// Compute summary statistics from the persistent log over the last
+// `windowSec` seconds. Falls back to whatever data is available if
+// the log is younger than the window. All output params are populated
+// even if no data exists (zeros).
+void computeStatsWindow(uint32_t windowSec,
+                        uint16_t& mn, uint16_t& avg, uint16_t& mx,
+                        uint16_t& zoneCounts4 /* good|mod|poor|vp */,
+                        uint16_t& zone1, uint16_t& zone2, uint16_t& zone3,
+                        uint16_t& zone4,
+                        float& tMinC, float& tMaxC,
+                        float& rhMin, float& rhMax,
+                        uint32_t& sampleCount,
+                        int8_t&  bestHour, int8_t& worstHour) {
+  mn = UINT16_MAX; mx = 0; avg = 0;
+  zone1 = zone2 = zone3 = zone4 = 0;
+  zoneCounts4 = 0;
+  tMinC = 1000; tMaxC = -1000;
+  rhMin = 1000; rhMax = -1000;
+  sampleCount = 0;
+  bestHour = worstHour = -1;
+
+  if (!fsReady || logHdr.count == 0) return;
+
+  File f = LittleFS.open(LOG_PATH, "r");
+  if (!f) return;
+
+  uint32_t total = logHdr.count;
+  uint32_t cap   = logHdr.capacity;
+  // Iterate all records, skip those outside the window if timestamps
+  // are valid. If no NTP sync ever happened, fall back to last N
+  // records by sample interval.
+  uint32_t now = (uint32_t)time(nullptr);
+  bool haveTime = (now > 1700000000UL);   // sanity: post-2023
+
+  // For best/worst hour-of-day, accumulate sums + counts per UTC hour
+  // (with TZ offset applied so it matches local clock).
+  uint32_t hourSum[24];   uint16_t hourCnt[24];
+  for (int i = 0; i < 24; i++) { hourSum[i] = 0; hourCnt[i] = 0; }
+
+  uint64_t coSum = 0;
+  uint32_t start = (total < cap) ? 0 : logHdr.head;
+  for (uint32_t i = 0; i < total; i++) {
+    uint32_t pos = (start + i) % cap;
+    f.seek(sizeof(LogHeader) + pos * sizeof(LogRecord));
+    LogRecord rec;
+    if (f.read((uint8_t*)&rec, sizeof(rec)) != sizeof(rec)) break;
+
+    // Window filtering
+    if (haveTime && rec.ts_utc != 0) {
+      if (now - rec.ts_utc > windowSec) continue;
+    } else {
+      // Without timestamps, take only the last (windowSec / 300s) records
+      uint32_t maxN = windowSec / 300;  // 5-min sample interval
+      if (i + maxN < total) continue;
+    }
+
+    sampleCount++;
+    coSum += rec.co2_ppm;
+    if (rec.co2_ppm < mn) mn = rec.co2_ppm;
+    if (rec.co2_ppm > mx) mx = rec.co2_ppm;
+    if (rec.co2_ppm < CO2_GOOD_MAX)        zone1++;
+    else if (rec.co2_ppm < CO2_MODERATE_MAX) zone2++;
+    else if (rec.co2_ppm < CO2_POOR_MAX)     zone3++;
+    else                                     zone4++;
+
+    float tc = rec.temp_c100 / 100.0f;
+    float rh = rec.rh_x10 / 10.0f;
+    if (tc < tMinC) tMinC = tc;
+    if (tc > tMaxC) tMaxC = tc;
+    if (rh < rhMin) rhMin = rh;
+    if (rh > rhMax) rhMax = rh;
+
+    // Per-hour aggregation for best/worst hour
+    if (haveTime && rec.ts_utc != 0) {
+      time_t t = (time_t)rec.ts_utc + tzOffsetMin * 60;
+      struct tm tmv;
+      gmtime_r(&t, &tmv);
+      int h = tmv.tm_hour;
+      if (h >= 0 && h < 24) {
+        hourSum[h] += rec.co2_ppm;
+        hourCnt[h]++;
+      }
+    }
+  }
+  f.close();
+
+  if (sampleCount > 0) avg = (uint16_t)(coSum / sampleCount);
+  else { mn = 0; tMinC = tMaxC = 0; rhMin = rhMax = 0; }
+
+  // Find best/worst hour-of-day (lowest/highest avg CO2)
+  uint32_t bestAvg  = UINT32_MAX;
+  uint32_t worstAvg = 0;
+  for (int h = 0; h < 24; h++) {
+    if (hourCnt[h] == 0) continue;
+    uint32_t a = hourSum[h] / hourCnt[h];
+    if (a < bestAvg)  { bestAvg  = a; bestHour  = h; }
+    if (a > worstAvg) { worstAvg = a; worstHour = h; }
+  }
+
+  // Suppress unused-param compiler warnings for zoneCounts4
+  // (passed in by reference but we don't actually pack it - kept
+  // in the signature for forward compatibility).
+  zoneCounts4 = zone1;  // arbitrary, not used by caller currently
+}
+
+// Format hours as "3 PM" / "15:00" depending on use24hClock.
+void formatHourLabel(char* buf, size_t bufSize, int8_t h) {
+  if (h < 0) { snprintf(buf, bufSize, "--"); return; }
+  if (use24hClock) {
+    snprintf(buf, bufSize, "%02d:00", h);
+  } else {
+    int h12 = h % 12; if (h12 == 0) h12 = 12;
+    snprintf(buf, bufSize, "%d %s", h12, h < 12 ? "AM" : "PM");
+  }
+}
+
+void drawStatsScreen() {
+  tft.fillScreen(COLOR_BG);
+
+  // Header bar
+  tft.fillRect(0, 0, SCREEN_W, SET_HEADER_H, COLOR_TITLE_BG);
+  tft.setTextDatum(ML_DATUM);
+  tft.setTextColor(COLOR_TITLE_TEXT, COLOR_TITLE_BG);
+  tft.drawString("< Back", 8, SET_HEADER_H / 2, 2);
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("24-hour Stats", SCREEN_W / 2, SET_HEADER_H / 2, 4);
+
+  // Compute stats
+  uint16_t mn, avg, mx, zc4, z1, z2, z3, z4;
+  float tMinC, tMaxC, rhMin, rhMax;
+  uint32_t samples;
+  int8_t bestH, worstH;
+  computeStatsWindow(86400, mn, avg, mx, zc4, z1, z2, z3, z4,
+                     tMinC, tMaxC, rhMin, rhMax,
+                     samples, bestH, worstH);
+
+  int y = SET_HEADER_H + 8;
+
+  if (samples == 0) {
+    tft.setTextDatum(MC_DATUM);
+    tft.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+    tft.drawString("No data yet", SCREEN_W / 2, 100, 4);
+    tft.drawString("Logs accumulate over time", SCREEN_W / 2, 130, 2);
+    return;
+  }
+
+  tft.setTextDatum(TL_DATUM);
+
+  // Section: CO2 statistics
+  tft.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+  tft.drawString("CO2 last 24h", 8, y, 2); y += 18;
+  tft.setTextColor(COLOR_TEXT, COLOR_BG);
+  char buf[48];
+  snprintf(buf, sizeof(buf), "Min %u  Avg %u  Max %u ppm", mn, avg, mx);
+  tft.drawString(buf, 8, y, 2); y += 22;
+
+  // Time-in-zone bar (240px wide minus 16 margin = 224 px; 16 tall)
+  int barX = 8, barY = y, barW = SCREEN_W - 16, barH = 16;
+  uint32_t totalSamples = z1 + z2 + z3 + z4;
+  if (totalSamples > 0) {
+    int x0 = barX;
+    int w1 = (int)((uint64_t)barW * z1 / totalSamples);
+    int w2 = (int)((uint64_t)barW * z2 / totalSamples);
+    int w3 = (int)((uint64_t)barW * z3 / totalSamples);
+    int w4 = barW - w1 - w2 - w3;
+    if (w1 > 0) tft.fillRect(x0, barY, w1, barH, TFT_GREEN);
+    if (w2 > 0) tft.fillRect(x0 + w1, barY, w2, barH, TFT_CYAN);
+    if (w3 > 0) tft.fillRect(x0 + w1 + w2, barY, w3, barH, TFT_ORANGE);
+    if (w4 > 0) tft.fillRect(x0 + w1 + w2 + w3, barY, w4, barH, TFT_RED);
+    tft.drawRect(barX, barY, barW, barH, COLOR_TEXT_DIM);
+  }
+  y += barH + 4;
+
+  // Zone legend (percentages)
+  tft.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+  uint8_t p1 = (uint8_t)((uint32_t)z1 * 100 / totalSamples);
+  uint8_t p4 = (uint8_t)((uint32_t)z4 * 100 / totalSamples);
+  snprintf(buf, sizeof(buf), "Good %u%%   Very Poor %u%%", p1, p4);
+  tft.drawString(buf, 8, y, 2); y += 22;
+
+  // Best / worst hour
+  if (bestH >= 0) {
+    char bh[8], wh[8];
+    formatHourLabel(bh, sizeof(bh), bestH);
+    formatHourLabel(wh, sizeof(wh), worstH);
+    tft.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+    tft.drawString("Best hour:", 8, y, 2);
+    tft.setTextColor(TFT_GREEN, COLOR_BG);
+    tft.drawString(bh, 100, y, 2);
+    y += 18;
+    tft.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+    tft.drawString("Worst hour:", 8, y, 2);
+    tft.setTextColor(TFT_RED, COLOR_BG);
+    tft.drawString(wh, 100, y, 2);
+    y += 22;
+  } else {
+    tft.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+    tft.drawString("(NTP not synced - hour stats unavailable)", 8, y, 1);
+    y += 14;
+  }
+
+  // Temp / RH section
+  tft.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+  tft.drawString("Climate last 24h", 8, y, 2); y += 18;
+  tft.setTextColor(COLOR_TEXT, COLOR_BG);
+  float tMinDisp = tempInFahrenheit ? (tMinC * 9/5 + 32) : tMinC;
+  float tMaxDisp = tempInFahrenheit ? (tMaxC * 9/5 + 32) : tMaxC;
+  snprintf(buf, sizeof(buf), "Temp %.1f - %.1f %s",
+           tMinDisp, tMaxDisp, tempUnit());
+  tft.drawString(buf, 8, y, 2); y += 18;
+  snprintf(buf, sizeof(buf), "RH   %.0f - %.0f %%", rhMin, rhMax);
+  tft.drawString(buf, 8, y, 2); y += 18;
+
+  // Sample count / footer
+  tft.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+  snprintf(buf, sizeof(buf), "%lu samples", (unsigned long)samples);
+  tft.drawString(buf, 8, y, 1); y += 12;
+
+  // Tap hint at bottom
+  tft.setTextDatum(MC_DATUM);
+  tft.drawString("Tap anywhere to go back", SCREEN_W / 2,
+                 SCREEN_H - 10, 1);
 }
 
 // ============================================================
@@ -1486,16 +2055,41 @@ void runForcedCalibration() {
 //                SETTINGS CHANGE HANDLERS
 // ============================================================
 
+// Helper for live setting changes: stop the periodic measurement,
+// wait the datasheet-required 500 ms before issuing config commands,
+// then restart. Any settings function passed in runs while the
+// chip is in idle mode. Returns whatever the inner function returned.
+//
+// Bug history: previously we used delay(20) here, which is far too
+// short - per the SCD41 datasheet, after stop_periodic_measurement
+// the chip needs 500 ms before it accepts new commands. With the
+// short delay, setSensorAltitude / setTemperatureOffset / etc.
+// sometimes silently failed and the chip kept the old setting,
+// even though our shadow variable + NVS were updated correctly.
+template <typename Fn>
+int16_t withChipIdle(Fn fn) {
+  scd4x.stopPeriodicMeasurement();
+  delay(500);
+  int16_t err = fn();
+  scd4x.startPeriodicMeasurement();
+  lastReadTime = millis();
+  return err;
+}
+
 void changeAltitude(int16_t delta) {
   int32_t v = (int32_t)sensorAltitudeM + delta;
   if (v < ALT_MIN) v = ALT_MIN;
   if (v > ALT_MAX) v = ALT_MAX;
-  sensorAltitudeM = (uint16_t)v;
+  uint16_t newAlt = (uint16_t)v;
+  if (newAlt == sensorAltitudeM) return;   // no change
+
+  sensorAltitudeM = newAlt;
   savePref("alt", sensorAltitudeM);
-  scd4x.stopPeriodicMeasurement(); delay(20);
-  scd4x.setSensorAltitude(sensorAltitudeM);
-  scd4x.startPeriodicMeasurement();
-  lastReadTime = millis();
+  int16_t err = withChipIdle([]() {
+    return scd4x.setSensorAltitude(sensorAltitudeM);
+  });
+  if (err) logError("setSensorAltitude (live)", err);
+  else Serial.printf("Altitude set to %u m\n", sensorAltitudeM);
 }
 
 void changeTempOffset(int direction) {
@@ -1505,12 +2099,15 @@ void changeTempOffset(int direction) {
   float v = tempOffsetC + deltaC;
   if (v < TEMP_OFF_MIN) v = TEMP_OFF_MIN;
   if (v > TEMP_OFF_MAX) v = TEMP_OFF_MAX;
+  if (v == tempOffsetC) return;   // no change
+
   tempOffsetC = v;
   savePref("tempoff", tempOffsetC);
-  scd4x.stopPeriodicMeasurement(); delay(20);
-  scd4x.setTemperatureOffset(tempOffsetC);
-  scd4x.startPeriodicMeasurement();
-  lastReadTime = millis();
+  int16_t err = withChipIdle([]() {
+    return scd4x.setTemperatureOffset(tempOffsetC);
+  });
+  if (err) logError("setTemperatureOffset (live)", err);
+  else Serial.printf("Temp offset set to %.1f C\n", tempOffsetC);
 }
 
 void changeTimezone(int delta) {
@@ -1531,7 +2128,10 @@ void handleTouch() {
   if (!readTap(x, y)) return;
 
   if (currentScreen == SCREEN_MAIN) {
-    if (btnCO2.contains(x, y)) {
+    if (btnDate.contains(x, y)) {
+      currentScreen = SCREEN_STATS;
+      drawStatsScreen();
+    } else if (btnCO2.contains(x, y)) {
       currentScreen = SCREEN_SETTINGS;
       drawSettingsScreen();
     } else if (btnClock.contains(x, y)) {
@@ -1541,6 +2141,21 @@ void handleTouch() {
       tempInFahrenheit = !tempInFahrenheit;
       savePref("tempf", tempInFahrenheit);
       drawReadings();
+      // Temperature unit affects the graph if it's currently in Temp
+      // mode, so refresh the frame and redraw the trace.
+      if (graphMode == GM_TEMP) {
+        recomputeChartBounds();
+        drawGraphFrame();
+        drawGraph();
+      }
+    } else if (btnGraph.contains(x, y)) {
+      // Cycle CO2 -> Temp -> RH -> CO2
+      graphMode = (GraphMode)((graphMode + 1) % 3);
+      savePref("gmode", (uint8_t)graphMode);
+      // Force a frame redraw because labels and caption changed
+      recomputeChartBounds();
+      drawGraphFrame();
+      drawGraph();
     }
   } else if (currentScreen == SCREEN_SETTINGS) {
     if (btnSetBack.contains(x, y))      { currentScreen = SCREEN_MAIN; drawMainScreen(); }
@@ -1569,6 +2184,10 @@ void handleTouch() {
       runForcedCalibration();
     }
   } else if (currentScreen == SCREEN_CAL_RESULT) {
+    currentScreen = SCREEN_MAIN;
+    drawMainScreen();
+  } else if (currentScreen == SCREEN_STATS) {
+    // Tap anywhere returns to main
     currentScreen = SCREEN_MAIN;
     drawMainScreen();
   } else if (currentScreen == SCREEN_WIFI_SETUP) {
@@ -1629,8 +2248,10 @@ bool readSensor() {
   return true;
 }
 
-void addGraphSample(uint16_t co2) {
-  co2History[historyHead] = co2;
+void addGraphSample(uint16_t co2, float t_c, float rh) {
+  co2History[historyHead]  = co2;
+  tempHistory[historyHead] = (int16_t)(t_c * 100.0f);
+  rhHistory[historyHead]   = (uint16_t)(rh * 10.0f);
   historyHead = (historyHead + 1) % MAX_SAMPLES;
   if (historyCount < MAX_SAMPLES) historyCount++;
   saveHistory();
@@ -1696,18 +2317,41 @@ void serviceNtp() {
 
 void startMdns() {
   if (mdnsRunning) return;
-  if (MDNS.begin(MDNS_HOSTNAME)) {
+  if (MDNS.begin(mdnsHostname.c_str())) {
     MDNS.addService("http", "tcp", 80);
     mdnsRunning = true;
-    Serial.printf("mDNS: http://%s.local/\n", MDNS_HOSTNAME);
+    Serial.printf("mDNS: http://%s.local/\n", mdnsHostname.c_str());
   } else {
     Serial.println("mDNS: failed");
   }
 }
 
+// Hostname validation per RFC 1123 / mDNS conventions:
+// - 1 to MDNS_HOSTNAME_MAX_LEN chars
+// - lowercase letters, digits, hyphens
+// - must not start or end with a hyphen
+static bool isValidHostname(const String& s) {
+  if (s.length() == 0 || s.length() > MDNS_HOSTNAME_MAX_LEN) return false;
+  if (s[0] == '-' || s[s.length() - 1] == '-') return false;
+  for (uint16_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    bool ok = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '-';
+    if (!ok) return false;
+  }
+  return true;
+}
+
+void restartMdns() {
+  if (mdnsRunning) {
+    MDNS.end();
+    mdnsRunning = false;
+  }
+  startMdns();
+}
+
 void tryWifiConnect() {
   WiFi.mode(WIFI_STA);
-  WiFi.setHostname(MDNS_HOSTNAME);
+  WiFi.setHostname(mdnsHostname.c_str());
 
   // Use WiFiManager to attempt connection with stored credentials.
   // setEnableConfigPortal(false) means: don't auto-launch the portal
@@ -1741,7 +2385,7 @@ void startWifiPortal() {
   wm.setConfigPortalBlocking(false);
   wm.setConfigPortalTimeout(WIFI_PORTAL_TIMEOUT);
   wm.setBreakAfterConfig(true);
-  wm.startConfigPortal(WIFI_AP_NAME);
+  wm.startConfigPortal(wifiApName.c_str());
   wifiPortalActive = true;
   currentScreen = SCREEN_WIFI_SETUP;
   drawWifiSetupScreen();
@@ -1785,8 +2429,173 @@ void serviceWifiPortal() {
 }
 
 // ============================================================
-//                     WEB SERVER
+//                     MQTT
 // ============================================================
+
+// Build a topic by joining the prefix with a sub-path.
+String mqttTopic(const char* sub) {
+  String t = mqttTopicPrefix;
+  if (!t.endsWith("/")) t += "/";
+  t += sub;
+  return t;
+}
+
+// Build a JSON state payload with all current readings.
+String mqttBuildStatePayload() {
+  String j = "{";
+  j += "\"co2\":";    j += String(currentCO2);            j += ",";
+  j += "\"temp_c\":"; j += String(currentTemp, 2);        j += ",";
+  j += "\"temp_f\":"; j += String(currentTemp * 9.0f / 5.0f + 32.0f, 2);
+  j += ",";
+  j += "\"rh\":";     j += String(currentRH, 1);          j += ",";
+  j += "\"status\":\""; j += co2StatusKey(currentCO2);    j += "\"";
+  j += "}";
+  return j;
+}
+
+// Publish Home Assistant MQTT discovery messages so HA picks up
+// the device's sensors automatically. We register one config per
+// metric, all sharing a "device" block so HA groups them.
+//
+// Discovery topic format:
+//   {discovery_prefix}/sensor/{node_id}/{object_id}/config
+// Where node_id is unique per device and object_id is per metric.
+void mqttPublishDiscovery() {
+  if (!mqttDiscoveryEnabled) return;
+  String node = mdnsHostname;
+  // HA requires node IDs to match [a-zA-Z0-9_-]+; replace any other char.
+  String nodeSafe;
+  for (size_t i = 0; i < node.length(); i++) {
+    char c = node[i];
+    nodeSafe += ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                 (c >= '0' && c <= '9') || c == '-' || c == '_')
+                ? c : '_';
+  }
+  String stateTopic = mqttTopic("state");
+
+  // Common device block
+  String dev = "\"dev\":{";
+  dev += "\"identifiers\":[\"" + nodeSafe + "\"],";
+  dev += "\"name\":\"" + mdnsHostname + "\",";
+  dev += "\"manufacturer\":\"" + String(FIRMWARE_AUTHOR) + "\",";
+  dev += "\"model\":\"CYD CO2 Monitor\",";
+  dev += "\"sw_version\":\"" + String(FIRMWARE_VERSION) + "\"";
+  dev += "}";
+
+  // Per-sensor config publish
+  struct SensorCfg {
+    const char* key;        // object_id / sub-key
+    const char* name;       // friendly name
+    const char* device_class;
+    const char* unit;
+    const char* state_class;
+    const char* value_tmpl; // jinja extracting from state JSON
+  };
+  SensorCfg sensors[] = {
+    {"co2",    "CO2",         "carbon_dioxide", "ppm", "measurement",
+     "{{ value_json.co2 }}"},
+    {"temp",   "Temperature", "temperature",
+     tempInFahrenheit ? "\\u00b0F" : "\\u00b0C", "measurement",
+     tempInFahrenheit ? "{{ value_json.temp_f }}" : "{{ value_json.temp_c }}"},
+    {"rh",     "Humidity",    "humidity",       "%",   "measurement",
+     "{{ value_json.rh }}"}
+  };
+  for (auto& s : sensors) {
+    String topic = mqttDiscoveryPrefix + "/sensor/" + nodeSafe + "/"
+                   + s.key + "/config";
+    String payload = "{";
+    payload += "\"name\":\""   + String(s.name)         + "\",";
+    payload += "\"uniq_id\":\""+ nodeSafe + "_" + s.key + "\",";
+    payload += "\"stat_t\":\"" + stateTopic             + "\",";
+    payload += "\"dev_cla\":\""+ String(s.device_class) + "\",";
+    payload += "\"unit_of_meas\":\"" + String(s.unit)   + "\",";
+    payload += "\"stat_cla\":\""+ String(s.state_class) + "\",";
+    payload += "\"val_tpl\":\"" + String(s.value_tmpl)  + "\",";
+    payload += dev;
+    payload += "}";
+    // Retained so HA picks it up after a broker restart
+    bool ok = mqttClient.publish(topic.c_str(), payload.c_str(), true);
+    if (!ok) {
+      Serial.printf("MQTT discovery publish failed: %s\n", topic.c_str());
+    }
+  }
+  mqttDiscoveryPublished = true;
+  Serial.println("MQTT: HA discovery published");
+}
+
+// Try to connect to the broker. Returns true if connected.
+bool mqttTryConnect() {
+  if (!mqttEnabled || mqttHost.length() == 0) return false;
+  if (mqttClient.connected()) return true;
+  if (!wifiConnected) return false;
+
+  mqttClient.setServer(mqttHost.c_str(), mqttPort);
+  mqttClient.setBufferSize(MQTT_BUFFER_SIZE);
+  mqttClient.setKeepAlive(MQTT_KEEPALIVE_S);
+
+  String clientId = mdnsHostname;
+  bool ok;
+  if (mqttUser.length() > 0) {
+    ok = mqttClient.connect(clientId.c_str(), mqttUser.c_str(),
+                            mqttPass.c_str());
+  } else {
+    ok = mqttClient.connect(clientId.c_str());
+  }
+  if (ok) {
+    Serial.printf("MQTT: connected to %s:%u as %s\n",
+                  mqttHost.c_str(), (unsigned)mqttPort, clientId.c_str());
+    // Publish HA discovery once per fresh connection
+    mqttDiscoveryPublished = false;
+    mqttPublishDiscovery();
+  } else {
+    Serial.printf("MQTT: connect failed (rc=%d)\n", mqttClient.state());
+  }
+  return ok;
+}
+
+// Publish the current readings. Called every MQTT_PUBLISH_INTERVAL_MS.
+void mqttPublishReadings() {
+  if (!mqttClient.connected()) return;
+  if (!dataValid) return;
+
+  char buf[24];
+  snprintf(buf, sizeof(buf), "%u", currentCO2);
+  mqttClient.publish(mqttTopic("co2").c_str(), buf);
+
+  snprintf(buf, sizeof(buf), "%.2f", currentTemp);
+  mqttClient.publish(mqttTopic("temp_c").c_str(), buf);
+
+  snprintf(buf, sizeof(buf), "%.2f", currentTemp * 9.0f / 5.0f + 32.0f);
+  mqttClient.publish(mqttTopic("temp_f").c_str(), buf);
+
+  snprintf(buf, sizeof(buf), "%.1f", currentRH);
+  mqttClient.publish(mqttTopic("rh").c_str(), buf);
+
+  mqttClient.publish(mqttTopic("status").c_str(), co2StatusKey(currentCO2));
+
+  // JSON state for HA discovery consumers
+  String state = mqttBuildStatePayload();
+  mqttClient.publish(mqttTopic("state").c_str(), state.c_str());
+}
+
+// Main service loop hook. Cheap when MQTT disabled.
+void serviceMqtt() {
+  if (!mqttEnabled) return;
+  if (!wifiConnected) return;
+
+  if (!mqttClient.connected()) {
+    if (millis() - lastMqttReconnectMs >= MQTT_RECONNECT_INTERVAL_MS) {
+      lastMqttReconnectMs = millis();
+      mqttTryConnect();
+    }
+  } else {
+    mqttClient.loop();   // process keep-alives / incoming
+    if (millis() - lastMqttPublishMs >= MQTT_PUBLISH_INTERVAL_MS) {
+      lastMqttPublishMs = millis();
+      mqttPublishReadings();
+    }
+  }
+}
 
 void startWebServer() {
   if (webServerRunning) return;
@@ -1794,6 +2603,9 @@ void startWebServer() {
   server.on("/data.json",    handleData);
   server.on("/history.csv",  handleHistoryCsv);
   server.on("/history.json", handleHistoryJson);
+  server.on("/sethostname",  HTTP_POST, handleSetHostname);
+  server.on("/mqtt",         handleMqttPage);
+  server.on("/setmqtt",      HTTP_POST, handleSetMqtt);
   server.onNotFound([](){ server.send(404, "text/plain", "Not found"); });
   ElegantOTA.begin(&server);    // adds /update endpoint
   server.begin();
@@ -1807,9 +2619,29 @@ void stopWebServer() {
   webServerRunning = false;
 }
 
+// Escape characters that have meaning in HTML so that user-supplied
+// strings (like the mDNS hostname) can be rendered safely inside
+// page templates and form attributes.
+String escapeHtml(const String& s) {
+  String out;
+  out.reserve(s.length());
+  for (uint16_t i = 0; i < s.length(); i++) {
+    char c = s[i];
+    switch (c) {
+      case '&':  out += "&amp;";  break;
+      case '<':  out += "&lt;";   break;
+      case '>':  out += "&gt;";   break;
+      case '"':  out += "&quot;"; break;
+      case '\'': out += "&#39;";  break;
+      default:   out += c;        break;
+    }
+  }
+  return out;
+}
+
 void handleRoot() {
   String html;
-  html.reserve(12000);
+  html.reserve(14000);
   html += F(
     "<!DOCTYPE html><html><head><meta charset='utf-8'>"
     "<meta name='viewport' content='width=device-width,initial-scale=1'>"
@@ -1843,7 +2675,7 @@ void handleRoot() {
 
   // Header with hostname
   html += F("<h1>CO2 Monitor <small>");
-  html += MDNS_HOSTNAME; html += F(".local</small></h1>");
+  html += mdnsHostname; html += F(".local</small></h1>");
 
   if (dataValid) {
     char buf[16];
@@ -1894,16 +2726,23 @@ void handleRoot() {
     html += F(" days old. Consider running Force Recalibrate outdoors.</div>");
   }
 
-  // Chart container
+  // Three chart containers: CO2, Temperature, Humidity
   html += F("<h2>Recent CO2</h2>"
             "<div class='chart-wrap'>"
-            "<canvas id='c' height='240'></canvas></div>");
+            "<canvas id='cCO2' height='220'></canvas></div>"
+            "<h2>Recent Temperature</h2>"
+            "<div class='chart-wrap'>"
+            "<canvas id='cTemp' height='180'></canvas></div>"
+            "<h2>Recent Humidity</h2>"
+            "<div class='chart-wrap'>"
+            "<canvas id='cRH' height='180'></canvas></div>");
 
   // Actions
   html += F("<div class='actions'>"
             "<a href='/history.csv' download>Download Full CSV</a> "
             "<a href='/data.json'>JSON</a> "
-            "<a href='/update'>Firmware Update</a>"
+            "<a href='/update'>Firmware Update</a> "
+            "<a href='/mqtt'>MQTT Setup</a>"
             "</div>");
 
   // Sample count info
@@ -1912,34 +2751,64 @@ void handleRoot() {
   html += String(logHdr.capacity); html += F(" capacity. ");
   html += String(historyCount); html += F(" in live graph.</p>");
 
-  // Chart script - fetch /history.json (last 288 = 24h) and draw
+  // Hostname configuration
+  html += F("<h2>Network name</h2>"
+            "<p style='color:#888;font-size:.9em;margin:4px 0 8px'>"
+            "Lowercase letters, digits, and hyphens only. Max 31 chars. "
+            "Cannot start or end with a hyphen.</p>"
+            "<form method='POST' action='/sethostname' "
+            "style='display:flex;gap:8px;align-items:center'>"
+            "<input name='h' value='");
+  html += escapeHtml(mdnsHostname);
+  html += F("' maxlength='31' "
+            "style='flex:1;padding:6px 8px;background:#222;color:#eee;"
+            "border:1px solid #444;border-radius:4px;font-family:monospace'>"
+            "<span style='color:#888'>.local</span>"
+            "<button style='background:#2a4060;color:#cef;border:0;"
+            "padding:8px 16px;border-radius:4px;cursor:pointer'>"
+            "Save</button></form>");
+
+  // Chart script - fetch /history.json and draw 3 charts
   html += F("<script>"
             "fetch('/history.json?n=288').then(r=>r.json()).then(d=>{"
-            "  const ctx=document.getElementById('c');"
-            "  new Chart(ctx,{type:'line',data:{"
-            "    labels:d.times,"
-            "    datasets:[{label:'CO2 ppm',data:d.co2,"
-            "      borderColor:'#6cf',borderWidth:1.5,"
-            "      pointRadius:0,fill:false,tension:0.2}]"
-            "  },options:{"
-            "    responsive:true,maintainAspectRatio:false,"
+            "  const common={responsive:true,maintainAspectRatio:false,"
+            "    interaction:{intersect:false,mode:'index'},"
             "    scales:{"
-            "      y:{suggestedMin:400,suggestedMax:1500,"
-            "         grid:{color:'#333'},ticks:{color:'#aaa'}},"
-            "      x:{grid:{color:'#333'},ticks:{color:'#aaa',maxTicksLimit:8}}"
+            "      y:{grid:{color:'#333'},ticks:{color:'#aaa'}},"
+            "      x:{grid:{color:'#333'},"
+            "         ticks:{color:'#aaa',maxTicksLimit:8}}"
             "    },"
             "    plugins:{legend:{labels:{color:'#aaa'}}}"
-            "  }});"
+            "  };"
+            "  function mk(id,label,data,color,yMin,yMax){"
+            "    const opts=JSON.parse(JSON.stringify(common));"
+            "    if(yMin!==null)opts.scales.y.suggestedMin=yMin;"
+            "    if(yMax!==null)opts.scales.y.suggestedMax=yMax;"
+            "    new Chart(document.getElementById(id),{type:'line',"
+            "      data:{labels:d.times,datasets:[{label:label,data:data,"
+            "        borderColor:color,borderWidth:1.5,"
+            "        pointRadius:0,fill:false,tension:0.2}]},"
+            "      options:opts});"
+            "  }"
+            "  mk('cCO2','CO2 ppm',d.co2,'#6cf',400,1500);"
+            "  mk('cTemp','Temp '+d.temp_unit,d.temp,'#fa3',null,null);"
+            "  mk('cRH','Humidity %',d.rh,'#9c6',20,80);"
             "});"
             "setTimeout(()=>location.reload(),60000);"
             "</script>");
 
-  html += F("</body></html>");
+  html += F("<p style='color:#555;font-size:.8em;text-align:center;"
+            "margin-top:32px'>Firmware v");
+  html += FIRMWARE_VERSION;
+  html += F(" by ");
+  html += FIRMWARE_AUTHOR;
+  html += F("</p></body></html>");
   server.send(200, "text/html; charset=utf-8", html);
 }
 
 void handleData() {
   String j = "{";
+  j += "\"firmware\":\""; j += FIRMWARE_VERSION; j += "\",";
   j += "\"co2_ppm\":";    j += String(currentCO2); j += ",";
   j += "\"temp_c\":";     j += String(currentTemp, 2); j += ",";
   j += "\"temp_f\":";     j += String(currentTemp * 9.0f / 5.0f + 32.0f, 2); j += ",";
@@ -2021,6 +2890,8 @@ void handleHistoryJson() {
 
   String times = "[";
   String co2s  = "[";
+  String temps = "[";
+  String rhs   = "[";
 
   if (fsReady && n > 0) {
     File f = LittleFS.open(LOG_PATH, "r");
@@ -2035,7 +2906,9 @@ void handleHistoryJson() {
         f.seek(sizeof(LogHeader) + pos * sizeof(LogRecord));
         LogRecord rec;
         if (f.read((uint8_t*)&rec, sizeof(rec)) != sizeof(rec)) break;
-        if (i > 0) { times += ","; co2s += ","; }
+        if (i > 0) {
+          times += ","; co2s += ","; temps += ","; rhs += ",";
+        }
         char tbuf[24];
         if (rec.ts_utc != 0) {
           time_t t = (time_t)rec.ts_utc + tzOffsetMin * 60;
@@ -2047,23 +2920,245 @@ void handleHistoryJson() {
         }
         times += tbuf;
         co2s  += String(rec.co2_ppm);
+        // Temperature in user-selected unit (matches device display)
+        float t_c = rec.temp_c100 / 100.0f;
+        float t_disp = tempInFahrenheit ? (t_c * 9.0f / 5.0f + 32.0f) : t_c;
+        temps += String(t_disp, 1);
+        rhs   += String(rec.rh_x10 / 10.0f, 1);
       }
       f.close();
     }
   }
-  times += "]"; co2s += "]";
+  times += "]"; co2s += "]"; temps += "]"; rhs += "]";
 
   String body = "{\"times\":";
   body += times;
   body += ",\"co2\":";
   body += co2s;
+  body += ",\"temp\":";
+  body += temps;
+  body += ",\"temp_unit\":\"";
+  body += tempUnit();
+  body += "\",\"rh\":";
+  body += rhs;
   body += "}";
   server.send(200, "application/json", body);
 }
 
-// ============================================================
-//                  SERIAL COMMANDS
-// ============================================================
+void handleSetHostname() {
+  String requested = server.arg("h");
+  requested.trim();
+  // Be forgiving with case: lowercase the input before validating
+  // (mDNS is case-insensitive but our validator only accepts lowercase).
+  requested.toLowerCase();
+
+  String style = F(
+    "<style>body{font-family:system-ui,sans-serif;background:#111;"
+    "color:#eee;margin:0;padding:20px;max-width:640px}"
+    "h1{margin:0 0 16px;border-bottom:1px solid #444;padding-bottom:8px}"
+    ".alert-bad{background:#3a1010;border-left:3px solid #f55;"
+    "padding:8px 12px;margin:12px 0}"
+    ".alert-good{background:#0a3a10;border-left:3px solid #5f5;"
+    "padding:8px 12px;margin:12px 0}"
+    "code{background:#222;padding:2px 6px;border-radius:3px}"
+    "a{color:#9cf}</style>");
+
+  if (!isValidHostname(requested)) {
+    String html = F("<!DOCTYPE html><html><head>");
+    html += style;
+    html += F("</head><body><h1>Invalid hostname</h1>"
+              "<div class='alert-bad'>That hostname is not allowed.</div>"
+              "<p>Hostnames must use only lowercase letters, digits, "
+              "and hyphens, must not start or end with a hyphen, and "
+              "must be 1 to 31 characters long.</p>"
+              "<p><a href='/'>&larr; Back</a></p>"
+              "</body></html>");
+    server.send(400, "text/html; charset=utf-8", html);
+    return;
+  }
+
+  // No-op when unchanged
+  if (requested == mdnsHostname) {
+    server.sendHeader("Location", "/", true);
+    server.send(303, "text/plain", "");
+    return;
+  }
+
+  // Save and apply
+  mdnsHostname = requested;
+  savePref("mdns", mdnsHostname);
+  WiFi.setHostname(mdnsHostname.c_str());
+  restartMdns();
+  Serial.printf("mDNS: hostname changed to '%s'\n", mdnsHostname.c_str());
+
+  // Show a confirmation page with both the new mDNS link AND the IP
+  // because the mDNS reannouncement can take a few seconds to
+  // propagate, and the browser may have cached the old name.
+  String ip = wifiConnected ? WiFi.localIP().toString() : String("");
+  String html = F("<!DOCTYPE html><html><head>");
+  html += style;
+  html += F("</head><body><h1>Hostname updated</h1>"
+            "<div class='alert-good'>Now reachable at:</div>"
+            "<p><a href='http://");
+  html += escapeHtml(mdnsHostname);
+  html += F(".local/'>http://");
+  html += escapeHtml(mdnsHostname);
+  html += F(".local/</a></p>"
+            "<p style='color:#888'>If the .local link does not work for "
+            "30-60 seconds, your router or device has cached the old "
+            "hostname. You can also reach the device by IP:</p>"
+            "<p><a href='http://");
+  html += ip;
+  html += F("/'>http://");
+  html += ip;
+  html += F("/</a></p>"
+            "</body></html>");
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+// ----- MQTT configuration page -----
+
+void handleMqttPage() {
+  String html;
+  html.reserve(6000);
+  html += F("<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>MQTT - CO2 Monitor</title>"
+            "<style>"
+            "body{font-family:system-ui,sans-serif;background:#111;color:#eee;"
+              "margin:0;padding:20px;max-width:640px}"
+            "h1{margin:0 0 16px;border-bottom:1px solid #444;padding-bottom:8px}"
+            "label{display:block;margin:12px 0 4px;color:#bbb}"
+            "input,select{width:100%;box-sizing:border-box;padding:8px;"
+              "background:#222;color:#eee;border:1px solid #444;"
+              "border-radius:4px;font-family:inherit;font-size:14px}"
+            "input[type=checkbox]{width:auto;margin-right:6px}"
+            ".row{display:flex;gap:8px}"
+            ".row>div{flex:1}"
+            ".tile{background:#222;border-radius:6px;padding:10px 14px;"
+              "margin:12px 0}"
+            ".tile .label{color:#888;font-size:.85em}"
+            ".tile .value{font-size:1.1em;font-weight:600}"
+            ".good{color:#3c3}.bad{color:#f55}"
+            "button{background:#2a4060;color:#cef;border:0;"
+              "padding:10px 20px;border-radius:4px;cursor:pointer;"
+              "font-size:14px;margin-top:16px}"
+            "button:hover{background:#3a557a}"
+            "a{color:#9cf}"
+            "p.help{color:#888;font-size:.9em;margin:4px 0}"
+            "</style></head><body>");
+  html += F("<h1>MQTT Configuration</h1>"
+            "<p><a href='/'>&larr; Back to dashboard</a></p>");
+
+  // Connection status tile
+  html += F("<div class='tile'><div class='label'>Status</div><div class='value ");
+  if (!mqttEnabled) {
+    html += F("'>Disabled</div></div>");
+  } else if (mqttClient.connected()) {
+    html += F("good'>Connected to ");
+    html += escapeHtml(mqttHost);
+    html += F(":");
+    html += String(mqttPort);
+    html += F("</div></div>");
+  } else if (mqttHost.length() == 0) {
+    html += F("bad'>Enabled but no broker host set</div></div>");
+  } else {
+    html += F("bad'>Disconnected (rc=");
+    html += String(mqttClient.state());
+    html += F(")</div></div>");
+  }
+
+  html += F("<form method='POST' action='/setmqtt'>"
+            "<label><input type='checkbox' name='en' value='1'");
+  if (mqttEnabled) html += F(" checked");
+  html += F("> Enable MQTT publishing</label>"
+            "<label>Broker host (IP or hostname)</label>"
+            "<input name='host' value='");
+  html += escapeHtml(mqttHost);
+  html += F("' placeholder='192.168.1.10 or mqtt.local'>"
+            "<div class='row'>"
+            "<div><label>Port</label>"
+            "<input name='port' type='number' min='1' max='65535' value='");
+  html += String(mqttPort);
+  html += F("'></div>"
+            "<div><label>Topic prefix</label>"
+            "<input name='topic' value='");
+  html += escapeHtml(mqttTopicPrefix);
+  html += F("' placeholder='co2monitor'></div>"
+            "</div>"
+            "<p class='help'>Topics published: "
+            "<code>{prefix}/co2</code>, <code>/temp_c</code>, "
+            "<code>/temp_f</code>, <code>/rh</code>, "
+            "<code>/status</code>, <code>/state</code> (JSON).</p>"
+            "<label>Username (optional)</label>"
+            "<input name='user' value='");
+  html += escapeHtml(mqttUser);
+  html += F("'>"
+            "<label>Password (optional)</label>"
+            "<input name='pass' type='password' value='");
+  html += escapeHtml(mqttPass);
+  html += F("' placeholder='(unchanged if blank)'>"
+            "<p class='help'>Leave password blank to keep the current value.</p>"
+            "<label><input type='checkbox' name='disc' value='1'");
+  if (mqttDiscoveryEnabled) html += F(" checked");
+  html += F("> Publish Home Assistant auto-discovery</label>"
+            "<label>HA discovery prefix</label>"
+            "<input name='disc_pfx' value='");
+  html += escapeHtml(mqttDiscoveryPrefix);
+  html += F("' placeholder='homeassistant'>"
+            "<button type='submit'>Save and connect</button>"
+            "</form>");
+
+  html += F("</body></html>");
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+void handleSetMqtt() {
+  bool en = server.hasArg("en");
+  String host = server.arg("host");
+  host.trim();
+  uint16_t port = MQTT_DEFAULT_PORT;
+  if (server.hasArg("port")) {
+    int v = server.arg("port").toInt();
+    if (v > 0 && v <= 65535) port = v;
+  }
+  String topic = server.arg("topic"); topic.trim();
+  if (topic.length() == 0) topic = mdnsHostname;
+  String user = server.arg("user"); user.trim();
+  String pass = server.arg("pass");
+  bool disc = server.hasArg("disc");
+  String disc_pfx = server.arg("disc_pfx"); disc_pfx.trim();
+  if (disc_pfx.length() == 0) disc_pfx = "homeassistant";
+
+  // Apply
+  mqttEnabled = en;
+  mqttHost    = host;
+  mqttPort    = port;
+  mqttTopicPrefix = topic;
+  mqttUser    = user;
+  // Preserve password if the field was left blank
+  if (pass.length() > 0) mqttPass = pass;
+  mqttDiscoveryEnabled = disc;
+  mqttDiscoveryPrefix  = disc_pfx;
+
+  // Persist
+  prefs.putBool  ("mqEn",    mqttEnabled);
+  prefs.putString("mqHost",  mqttHost);
+  prefs.putUShort("mqPort",  mqttPort);
+  prefs.putString("mqTopic", mqttTopicPrefix);
+  prefs.putString("mqUser",  mqttUser);
+  prefs.putString("mqPass",  mqttPass);
+  prefs.putBool  ("mqDisc",  mqttDiscoveryEnabled);
+  prefs.putString("mqDiscPfx", mqttDiscoveryPrefix);
+
+  // Disconnect any current session so the new settings take effect
+  if (mqttClient.connected()) mqttClient.disconnect();
+  lastMqttReconnectMs = 0;  // try connect immediately on next loop
+
+  // Redirect back to /mqtt to show the new status
+  server.sendHeader("Location", "/mqtt", true);
+  server.send(303, "text/plain", "Saved");
+}
 
 void doFRCSerial(uint16_t target) {
   if (target < 350 || target > 2000) {
@@ -2086,13 +3181,19 @@ void doFRCSerial(uint16_t target) {
 }
 
 void setAscFromSerial(bool enable) {
+  // Note: we DO NOT persist this to NVS. ASC always reverts to OFF
+  // on the next boot. If you want it on long-term, add 'asc on' to
+  // your boot routine somewhere safe.
   ascEnabled = enable;
-  savePref("asc", ascEnabled);
-  scd4x.stopPeriodicMeasurement(); delay(20);
-  scd4x.setAutomaticSelfCalibrationEnabled(ascEnabled ? 1 : 0);
-  scd4x.startPeriodicMeasurement();
-  lastReadTime = millis();
-  Serial.printf("ASC %s\n", enable ? "enabled" : "disabled");
+  int16_t err = withChipIdle([]() {
+    return scd4x.setAutomaticSelfCalibrationEnabled(ascEnabled ? 1 : 0);
+  });
+  if (err) {
+    Serial.printf("ASC: setAutomaticSelfCalibrationEnabled failed (err %d)\n", err);
+  } else {
+    Serial.printf("ASC %s (this session only; resets to OFF on reboot)\n",
+                  enable ? "enabled" : "disabled");
+  }
 }
 
 void wifiResetSerial() {
@@ -2110,22 +3211,69 @@ void wifiStatusSerial() {
     Serial.printf("Connected, IP: %s\n", WiFi.localIP().toString().c_str());
     Serial.printf("RSSI: %d dBm\n", WiFi.RSSI());
     Serial.printf("NTP synced: %s\n", ntpSynced ? "yes" : "no");
-    Serial.printf("mDNS: http://%s.local/\n", MDNS_HOSTNAME);
+    Serial.printf("mDNS: http://%s.local/\n", mdnsHostname.c_str());
   } else {
     Serial.println("Not connected");
   }
 }
 
+// ============================================================
+//                  SERIAL COMMANDS
+// ============================================================
+
 void printInfo() {
-  Serial.printf("ASC:         %s\n", ascEnabled ? "ON" : "OFF");
-  Serial.printf("Altitude:    %u m\n", sensorAltitudeM);
-  Serial.printf("Temp off:    %.1f C  (%.1f F)\n",
+  Serial.printf("Firmware:    v%s by %s\n", FIRMWARE_VERSION, FIRMWARE_AUTHOR);
+  // Query the chip directly for its current settings. These are the
+  // authoritative values - if they disagree with our shadow vars,
+  // something has gone wrong (failed write, stale NVS, etc).
+  scd4x.stopPeriodicMeasurement();
+  delay(500);   // datasheet requires this before any config command
+  uint16_t chipAsc = 0xFFFF;
+  uint16_t chipAlt = 0xFFFF;
+  float chipTempOff = NAN;
+  int16_t errAsc = scd4x.getAutomaticSelfCalibrationEnabled(chipAsc);
+  int16_t errAlt = scd4x.getSensorAltitude(chipAlt);
+  int16_t errToff = scd4x.getTemperatureOffset(chipTempOff);
+  scd4x.startPeriodicMeasurement();
+  lastReadTime = millis();
+
+  Serial.printf("ASC (shadow):  %s\n", ascEnabled ? "ON" : "OFF");
+  if (errAsc) {
+    Serial.printf("ASC (chip):    <read error %d>\n", errAsc);
+  } else {
+    Serial.printf("ASC (chip):    %s%s\n",
+                  chipAsc ? "ON" : "OFF",
+                  (chipAsc != 0) != ascEnabled ? "  <-- MISMATCH!" : "");
+  }
+  Serial.printf("Alt (shadow):  %u m\n", sensorAltitudeM);
+  if (errAlt) {
+    Serial.printf("Alt (chip):    <read error %d>\n", errAlt);
+  } else {
+    Serial.printf("Alt (chip):    %u m%s\n",
+                  chipAlt,
+                  chipAlt != sensorAltitudeM ? "  <-- MISMATCH!" : "");
+  }
+  Serial.printf("Toff (shadow): %.1f C  (%.1f F)\n",
                 tempOffsetC, tempOffsetC * 9.0f / 5.0f);
+  if (errToff) {
+    Serial.printf("Toff (chip):   <read error %d>\n", errToff);
+  } else {
+    Serial.printf("Toff (chip):   %.1f C%s\n",
+                  chipTempOff,
+                  fabs(chipTempOff - tempOffsetC) > 0.1f ? "  <-- MISMATCH!" : "");
+  }
   Serial.printf("Temp unit:   %s\n", tempInFahrenheit ? "F" : "C");
-  Serial.printf("Brightness:  %u%%\n", (unsigned)brightnessPct);
+  if (brightnessPct == BRIGHTNESS_AUTO) {
+    Serial.printf("Brightness:  AUTO (LDR %.0f%% -> backlight %u%%)\n",
+                  ldrSmoothedPct, lastAutoDutyPct);
+  } else {
+    Serial.printf("Brightness:  %u%%\n", (unsigned)brightnessPct);
+  }
+  Serial.printf("LDR raw:     %d\n", analogRead(LDR_PIN));
   Serial.printf("Timezone:    UTC%+d:%02d\n", tzOffsetMin / 60, abs(tzOffsetMin) % 60);
   Serial.printf("Clock:       %s\n", use24hClock ? "24h" : "12h");
   Serial.printf("NTP:         %s (%s)\n", ntpEnabled ? "on" : "off", ntpServer.c_str());
+  Serial.printf("Hostname:    %s.local\n", mdnsHostname.c_str());
   Serial.printf("Uptime:      %lu s total\n", (unsigned long)getTotalUptimeSec());
   uint32_t d = daysSinceLastFrc();
   if (d == UINT32_MAX) Serial.println("Last cal:    never");
@@ -2134,6 +3282,14 @@ void printInfo() {
                 (unsigned long)logHdr.count, (unsigned long)logHdr.capacity);
   Serial.printf("Live graph:  %d samples\n", historyCount);
   wifiStatusSerial();
+  Serial.printf("MQTT:        %s\n",
+                !mqttEnabled            ? "disabled" :
+                mqttClient.connected()  ? "connected" :
+                mqttHost.length() == 0  ? "no host"   : "disconnected");
+  if (mqttEnabled && mqttHost.length() > 0) {
+    Serial.printf("MQTT broker: %s:%u\n", mqttHost.c_str(), (unsigned)mqttPort);
+    Serial.printf("MQTT topic:  %s\n", mqttTopicPrefix.c_str());
+  }
 }
 
 void handleSerialCommands() {
@@ -2189,9 +3345,16 @@ void setup() {
   tft.fillScreen(TFT_BLACK);
   tft.setTextDatum(MC_DATUM);
   tft.setTextColor(TFT_CYAN, TFT_BLACK);
-  tft.drawString("CO2 Monitor", SCREEN_W / 2, SCREEN_H / 2 - 20, 4);
+  tft.drawString("CO2 Monitor", SCREEN_W / 2, SCREEN_H / 2 - 30, 4);
   tft.setTextColor(TFT_LIGHTGREY, TFT_BLACK);
-  tft.drawString("Initializing...", SCREEN_W / 2, SCREEN_H / 2 + 20, 2);
+  tft.drawString("v" FIRMWARE_VERSION, SCREEN_W / 2, SCREEN_H / 2 + 4, 2);
+  tft.drawString("Initializing...",   SCREEN_W / 2, SCREEN_H / 2 + 32, 2);
+
+  // Author byline at bottom of splash
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.drawString("by " FIRMWARE_AUTHOR, SCREEN_W / 2, SCREEN_H - 16, 1);
+
+  Serial.printf("Firmware v%s by %s\n", FIRMWARE_VERSION, FIRMWARE_AUTHOR);
 
   initSensor();
   delay(5500);
@@ -2222,6 +3385,8 @@ void loop() {
 
   saveUptimePeriodic();
   serviceNtp();
+  serviceAutoBrightness();
+  serviceMqtt();
 
   // Tick the clock once a second on the main screen.
   // Also redraw the date row when the date changes (or just became
@@ -2248,7 +3413,7 @@ void loop() {
   if (dataValid &&
       (lastSampleTime == 0 || now - lastSampleTime >= SAMPLE_INTERVAL_MS)) {
     lastSampleTime = now;
-    addGraphSample(currentCO2);
+    addGraphSample(currentCO2, currentTemp, currentRH);
     appendLog(currentCO2, currentTemp, currentRH);
     if (isMainScreen) {
       drawGraph();

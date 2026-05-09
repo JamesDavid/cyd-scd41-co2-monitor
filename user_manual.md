@@ -45,7 +45,7 @@ If a calibration is more than 90 days old, an orange "Calibration overdue - tap 
 1. Plug into power via the micro-USB or USB-C port. The screen lights up and shows "Initializing..." for a few seconds.
 2. The CO2 number appears as "warming up..." for the first 5-10 seconds while the sensor takes its first reading.
 3. Once a reading appears, the device is functional. You can use it stand-alone right now.
-4. **Set up WiFi (optional)**: tap the CO2 number to enter Settings, then tap the WiFi tile at the bottom. Connect your phone to the AP called `CO2-Monitor-Setup`, pick your home network, enter the password. The device saves it and reconnects automatically on every future boot.
+4. **Set up WiFi (optional)**: tap the CO2 number to enter Settings, then tap the WiFi tile at the bottom. Connect your phone to the AP called `CO2-Monitor-Setup-XXXXXX` (where XXXXXX is a 6-character ID unique to your device — the exact name appears on the WiFi setup screen so you can read it off). Pick your home network from the captive portal, enter the password. The device saves it and reconnects automatically on every future boot.
 5. **Set the clock (optional)**: with WiFi working, tap the time at the top of the screen, set your timezone, choose 12 or 24-hour format. Time auto-syncs from internet time servers.
 6. **Calibrate (recommended after a few days)**: see the calibration section below.
 
@@ -56,7 +56,7 @@ If a calibration is more than 90 days old, an orange "Calibration overdue - tap 
 - **Temp Off.**: temperature offset. The sensor reads a few degrees higher than ambient because it self-heats from the electronics. Use the +/- buttons to compensate. The default of +5.7°C / +10.2°F is a good starting point. Fine-tune by comparing with a separate, known-accurate thermometer after the device has been on for at least an hour.
 - **Last cal: N days ago**: shows when you last calibrated. Turns orange and suggests recalibration after 90 days.
 - **Force Recalibrate**: opens the calibration flow.
-- **WiFi tile**: shows IP and `co2monitor.local` hostname when connected. Tap to reconfigure or initially set up.
+- **WiFi tile**: shows the IP address and the device's `.local` hostname when connected. The default hostname is `co2monitor-XXXXXX` (where XXXXXX is unique to your device); you can change it to something more memorable from the web interface — see below. Tap the tile to reconfigure or initially set up WiFi.
 
 ## Time settings (tap the clock)
 
@@ -96,7 +96,7 @@ After a successful calibration the device returns to the main screen. The "Last 
 
 Once WiFi is set up, the device runs a small web server. From any computer or phone on the same network, visit:
 
-**http://co2monitor.local/**
+**http://co2monitor-XXXXXX.local/** (where XXXXXX is the unique device suffix shown on the WiFi tile in Settings, or whatever custom name you've set in the web interface)
 
 (If `.local` doesn't work, use the IP address shown in the WiFi tile in Settings.)
 

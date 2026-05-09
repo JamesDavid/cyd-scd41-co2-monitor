@@ -166,6 +166,55 @@ If you observe **continuous backlight flicker even at full brightness**, that's 
 
 Some CYD revisions reportedly have a hardware pull-up on the backlight pin that overrides PWM control entirely. If duty cycle changes have no visible effect even at 1 kHz, you're probably on one of those boards and brightness control just isn't possible without removing that pull-up.
 
+## LDR (ambient light sensor)
+
+The component on the front of the PCB silkscreened **R21** is *not* a regular resistor — it's a GT36516 photoconductive cell. Sunton's schematic numbers all two-terminal passive components in a single R-series, regardless of whether they're fixed resistors or photoresistors, which is confusing.
+
+**Physical location**: looking at the front of the board with the USB ports on the right short edge (landscape, screen right-side-up), the LDR sits near the **left short edge, close to the bottom long edge** — roughly 8-10 mm in from the left short edge, 6-8 mm up from the bottom long edge. It is *next to* the active display, not above or below it.
+
+Wiring on the v2 / v3 boards:
+
+```
+ 3.3V ----[ R15 ]----+---- GPIO 34 (ADC1_CH6, input-only)
+                     |
+                     +----[ R19 ]----+---- GND
+                                     |
+                              [ LDR (R21) ]----GND
+```
+
+R15 (pull-up to 3.3V) and R19 (pull-down to GND, in parallel with the LDR) form a voltage divider against the LDR's variable resistance. On older boards both were 1MΩ; on 2024+ revisions they're around 10kΩ, which gives a more useful range on the ADC because the LDR's typical illuminated resistance is in the 5-10kΩ neighborhood.
+
+LDR resistance behavior:
+- **Bright daylight**: ~5kΩ
+- **Normal indoor lighting**: 10-30kΩ
+- **Dim room**: 50-200kΩ
+- **Pitch dark** (after ~10s for the cell to relax): >300kΩ
+
+Because the LDR is on the *low* side of the divider, GPIO 34 reads **high in the dark** and **low in bright light**:
+
+```cpp
+int raw = analogRead(34);   // 0..4095
+// On the test unit, raw ≈ 200 in bright light, ≈ 3500 in pitch dark.
+// Calibrate your specific board with `info` debug output once.
+```
+
+**Auto-brightness implementation**: We use the LDR to drive backlight PWM duty cycle as an "Auto" mode option. Workflow: read `analogRead(34)` every 2 seconds, map raw → 0-100% via the calibrated dark/bright endpoints, exponentially smooth (alpha 0.15) to absorb transient shadows, then map the smoothed value to a PWM duty cycle between 15% (very dim) and 100% (full bright). Smoothing is essential — without it, a passing hand or a flickering desk lamp causes constant backlight changes that are themselves distracting.
+
+Calibration tip: enable Auto mode, run the `info` serial command in different lighting conditions, note the raw ADC values, and tune `LDR_DARK_RAW` / `LDR_BRIGHT_RAW` in the firmware.
+
+**Caveats**:
+- GPIO 34 is input-only (no pull-ups can be enabled, no output mode). Fine for ADC use, but you can't repurpose it for output if you decide you don't want the LDR.
+- ADC1 readings on the ESP32 are noisy and have a non-linear response curve (especially below 100mV). For a 0-100 brightness mapping this doesn't matter, but if you wanted to log "lux" you'd need a real light sensor.
+- The LDR has **slow recovery from dark** — it can take 10+ seconds to climb its resistance after going from a lit room to total darkness. The smoothing in firmware happens to mask this, but be aware.
+- Older boards with 1MΩ dividers will saturate the ADC at the high end (reading ~4095 / dark) much more easily, so the usable dynamic range is smaller. The 2024+ 10kΩ divider is much better.
+- **Backlight bleed contaminates the LDR reading.** This is the big one. The LDR sits very close to the LCD module, and without optical isolation it picks up sideways-leaking backlight light instead of room light. Symptom: in a pitch-dark room with no bezel hole at all, the LDR still reads as if the room is brightly lit (we measured 79-82%). In bright rooms the room light dominates so the problem is hidden, but in dim conditions you get a positive feedback loop where the LDR sees mostly its own backlight. Mitigations: a printed shroud around the LDR inside the case (the SCAD file has this as `ldr_shroud = true`), a black tape patch over the LDR with a pinhole through it for the bezel hole alignment, or printing the case in opaque black filament so the bezel itself doesn't conduct light from the LCD edge.
+
+**Physical mounting**: if you put the CYD in an enclosure, leave a small opening (3-4mm diameter) over the LDR position. Note that the LDR is *not* in the middle of the bezel — it's offset to one corner of the board near the short edge opposite the USB ports. Don't make a centered hole expecting it to align.
+
+**Critical: light isolation from the LCD backlight.** The LDR sits directly adjacent to the LCD module on the same side of the PCB. With the case closed and the backlight on, edge-light from the LCD leaks across the case interior and reaches the LDR — enough that a pitch-dark room reads ~80% on the LDR scale (i.e., "well-lit"). Auto-brightness becomes useless because the LDR mostly sees the backlight, not the room.
+
+The fix is a small opaque shroud — a square or round tube on the inside of the front bezel that protrudes down to within ~1 mm of the LDR surface, blocking light from the LCD-side from reaching the sensor while leaving the front-facing optical path through the bezel hole clean. Our 3D-printed stand has this built in (parameters `ldr_shroud`, `ldr_shroud_drop`, etc. in the SCAD file). Without the shroud, auto-brightness simply does not work in a closed case. Black foam tape between the LCD and LDR is a reasonable hand-built alternative.
+
 ## RGB LED gotcha
 
 GPIO 4, 16, 17 drive the on-board RGB LED, active LOW. They float low at boot, which makes the red LED come on dimly until something explicitly drives them HIGH. Always do this in `setup()`:
@@ -206,5 +255,7 @@ Per DIYmall datasheet, the four mounting holes are inset 4.0mm from each PCB edg
 - Don't use 5V on the I2C connector. The 3V3 pin on the connector is your supply for sensors.
 - Touch coordinates do **not** auto-rotate with the display.
 - Backlight PWM at "normal" frequencies (10+ kHz) does nothing visible because the on-board MOSFET can't switch off fast enough. Use 5 kHz or lower — counter-intuitive but real. See the Backlight section.
+- The LDR (light sensor) above the screen is silkscreened **R21**. Sunton labels it as if it were a regular resistor; it's actually a photoresistor on GPIO 34. Easy to miss when reading the schematic.
+- The LDR is mounted right next to the LCD module. Without an internal light shroud, LCD backlight leakage drowns out room light at the sensor and auto-brightness reads "lit" even in a pitch-dark case. See the LDR section.
 - ASC on the SCD41 will silently degrade your readings if the device is indoors. Disable it explicitly.
 - The graph on a 240x320 portrait screen has limited vertical room. Keep it short and use color rather than fine resolution to convey range.
