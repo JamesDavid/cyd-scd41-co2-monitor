@@ -1,0 +1,12 @@
+# Arduino IDE build output
+cyd_scd41_co2_monitor_portrait/build/
+
+# Exported compiled binaries
+*.ino.esp32.bin
+*.ino.bin
+*.ino.elf
+*.ino.map
+
+# Claude Code local-only settings
+.claude/settings.local.json
+
