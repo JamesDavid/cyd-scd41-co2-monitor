@@ -227,6 +227,10 @@ pinMode(17, OUTPUT); digitalWrite(17, HIGH);
 
 These pins are otherwise free for repurposing if you don't want the LED.
 
+## Bluetooth + WiFi coexistence
+
+The classic ESP32 on the CYD has a single 2.4 GHz radio shared between WiFi and BLE. They *can* run together (software coexistence is enabled by default in the Arduino/IDF stack), but they time-slice the antenna, so BLE activity steals airtime from WiFi. This firmware uses BLE only to passively sniff an Aranet Rn radon advertisement, and keeps it cheap: a short (~3 s) non-blocking scan roughly once a minute (`serviceBleScan`). Don't turn that into a long or continuous scan — the web server, MQTT, and OTA all share the same radio and will stutter. NimBLE (not the heavier Bluedroid stack) is used to keep the flash footprint down; even so it adds ~240 KB, which is why the project moved to a custom 1.5 MB-app partition table (`partitions.csv`).
+
 ## Mounting holes
 
 Per DIYmall datasheet, the four mounting holes are inset 4.0mm from each PCB edge. Centre-to-centre pitch is therefore 78mm × 42mm. Holes accept M3 self-tapping screws cleanly into PLA/PETG with a 2.5mm pilot.

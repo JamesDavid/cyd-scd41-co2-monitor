@@ -15,6 +15,18 @@ CO2 in fresh outdoor air sits around 420 ppm. Indoor CO2 climbs as people breath
 
 A small arrow next to the number shows whether CO2 is rising or falling over the last several samples.
 
+### Radon (optional, needs an Aranet Rn)
+
+If you have an **Aranet Rn** radon detector with "Smart Home Integration" turned on in the Aranet app, this monitor listens for it over Bluetooth and shows radon as a third reading at the bottom of the screen — no pairing or wiring needed. Radon is a colorless radioactive gas; long-term exposure to high levels raises lung-cancer risk. The radon number is color-coded:
+
+| Reading | Color | What it means |
+|---|---|---|
+| Below 100 Bq/m³ (2.7 pCi/L) | Green | Low |
+| 100-147 Bq/m³ | Orange | Elevated — WHO reference level |
+| 148+ Bq/m³ (4 pCi/L) | Red | High — US EPA action level; consider mitigation |
+
+Radon only appears when a recent reading has been received. If the Aranet goes out of range or is switched off, the radon column disappears after a few minutes and the bottom row returns to just Temp and RH. The Aranet measures radon every 10 minutes, so the number updates slowly. A small battery icon appears next to "RADON" when the Aranet's battery is low.
+
 ## The screen
 
 ```
@@ -26,10 +38,10 @@ A small arrow next to the number shows whether CO2 is rising or falling over the
               760                       <- big reading + trend arrow
             GOOD AIR                    <- color-coded status
 
-      TEMP            RH
-      72.4 F          48 %              <- tap TEMP to switch F/C
+   TEMP        RH      RADON            <- RADON column only when in range
+   72.4 F      48 %    96 Bq            <- tap TEMP=F/C, tap RADON=Bq/pCi
 
-      [---small CO2 trend graph---]
+      [---small trend graph---]         <- tap to cycle CO2/Temp/RH/Radon
 ```
 
 **What's tappable:**
@@ -37,6 +49,8 @@ A small arrow next to the number shows whether CO2 is rising or falling over the
 - **Clock**: opens Time Settings (timezone, 12/24-hour format, NTP).
 - **CO2 number**: opens Settings (calibration, altitude, temp offset, WiFi).
 - **Temperature value**: switches between Fahrenheit and Celsius.
+- **Radon value** (when shown): switches between Bq/m³ and pCi/L.
+- **Graph**: cycles through CO2, Temperature, Humidity, and Radon (Radon is included only when a reading is present).
 
 If a calibration is more than 90 days old, an orange "Calibration overdue - tap CO2" message appears at the bottom of the screen.
 

@@ -27,6 +27,13 @@
  *   VDD -> 3.3V    SDA -> GPIO 27
  *   GND -> GND     SCL -> GPIO 22
  *
+ * Optional radon (Aranet Rn over BLE):
+ *   If an Aranet Rn radon detector with "Smart Home Integration" mode is
+ *   in range, the firmware passively sniffs its BLE advertisement (no
+ *   pairing) and shows radon as a fourth metric: a Temp|RH|Radon bottom
+ *   row, a tappable radon graph, plus radon in the CSV/JSON/web/MQTT.
+ *   Tap the radon value to toggle Bq/m3 <-> pCi/L. Configure at /radon.
+ *
  * Required libraries:
  *   - TFT_eSPI                 by Bodmer
  *   - XPT2046_Touchscreen      by Paul Stoffregen
@@ -34,6 +41,7 @@
  *   - Sensirion Core           (auto-installed dependency)
  *   - WiFiManager              by tzapu (tablatronix)  v2.0.17+
  *   - ElegantOTA               by Ayush Sharma         v3.x
+ *   - NimBLE-Arduino           by h2zero                v1.4.x
  *
  * Serial commands (115200 baud):
  *   wifi-setup     start the WiFi config portal
@@ -42,10 +50,12 @@
  *   frc <ppm>      manual Forced Recalibration
  *   asc on / off   toggle Automatic Self-Calibration (default OFF)
  *   info           print all current settings
+ *   ble-status     print seen Aranet Rn devices + selected radon source
  *   reset          clear NVS preferences
  *   erase-log      wipe LittleFS sample log
  */
 
+#include <Arduino.h>
 #include <Wire.h>
 #include <SPI.h>
 #include <math.h>
@@ -61,6 +71,7 @@
 #include <XPT2046_Touchscreen.h>
 #include <SensirionI2cScd4x.h>
 #include <PubSubClient.h>
+#include <NimBLEDevice.h>
 
 // ============================================================
 //                  VERSION / AUTHORSHIP
@@ -79,7 +90,7 @@
 // Current human user prefers their byline left as-is; only edit
 // FIRMWARE_AUTHOR if explicitly asked.
 //
-#define FIRMWARE_VERSION  "1.6.2"
+#define FIRMWARE_VERSION  "1.7.0"
 #define FIRMWARE_AUTHOR   "github.com/JamesDavid"
 
 // ============================================================
@@ -212,8 +223,32 @@
 // LittleFS log
 #define LOG_PATH            "/co2log.bin"
 #define LOG_MAGIC           0x4332474F    // "CO2L"
-#define LOG_VERSION         1
-#define LOG_MAX_RECORDS     120000UL      // ~415 days at 5 min/sample
+#define LOG_VERSION         2              // v2 added radon_bqm3 to LogRecord (10 -> 12 bytes)
+#define LOG_MAX_RECORDS     80000UL        // ~277 days at 5 min/sample (fits ~0.94 MB LittleFS)
+
+// ----------------- Radon (Aranet Rn over BLE) -----------------
+// The Aranet Rn (Smart Home Integration mode) broadcasts its latest
+// reading in a BLE advertisement (manufacturer id 0x0702). We sniff it
+// passively - no pairing. See README.md / scd41.md siblings for the
+// byte layout. We periodically run a short active scan (active so we
+// also capture the device's friendly name from the scan response).
+#define ARANET_COMPANY_ID    0x0702       // SAF Tehnika, little-endian 02 07
+#define ARANET_TYPE_RADON    0x03         // mfr-data byte 2 (device type)
+#define ARANET_MFG_MIN_LEN   25           // bytes we need (radon..status..ago)
+#define RADON_OFF_VALUE      10           // uint16 LE radon, in full mfr-data buffer
+#define RADON_OFF_BATTERY    19           // uint8 battery %
+#define RADON_OFF_STATUS     20           // uint8 status colour (1/2/3)
+#define RADON_INVALID_MIN    0x1F00       // radon value >= this means "invalid"
+#define RADON_NONE           0xFFFF       // sentinel: "no radon sample"
+#define RADON_BATT_LOW       20           // <= this percent triggers low-battery marker
+#define RADON_DEFAULT_STALE_MIN  15       // hide radon if no advert seen in this many minutes
+#define BLE_SCAN_PERIOD_MS   (60UL * 1000UL)  // how often to start a scan
+#define BLE_SCAN_SECS        3            // scan window length (seconds)
+#define BLE_MAX_DEVICES      6            // seen-device table size
+#define BQ_PER_PCIL          37.0f        // 1 pCi/L = 37 Bq/m3
+// Radon zone thresholds (Bq/m3): WHO reference 100, EPA 4 pCi/L ~= 148
+#define RADON_ZONE_MOD_BQ    100
+#define RADON_ZONE_HIGH_BQ   148
 
 // ----------------- Touch calibration -----------------
 // Calibrated from corner taps. The CYD's touch chip axes are swapped
@@ -324,6 +359,9 @@ const Rect btnClock     = {0, CLOCK_Y - 4, SCREEN_W, CLOCK_H + 8};
 // Tap on the CO2 number opens Settings (replaces the old CAL button).
 const Rect btnCO2       = {0, CO2_LABEL_Y - 4, SCREEN_W, 64};
 const Rect btnTempUnit  = {0, TR_TOP - 6, SCREEN_W / 2, 60};
+// Tap the radon column (right third of the bottom row, only active when
+// radon is present) to toggle Bq/m3 <-> pCi/L.
+const Rect btnRadon     = {SCREEN_W * 2 / 3, TR_TOP - 6, SCREEN_W / 3, 60};
 // Tap on the graph (or its caption row) to cycle CO2 -> Temp -> Humidity.
 const Rect btnGraph     = {0, GRAPH_CAPTION_Y - 6, SCREEN_W,
                            (GRAPH_Y - GRAPH_CAPTION_Y) + GRAPH_H + 12};
@@ -414,6 +452,38 @@ unsigned long lastMqttPublishMs = 0;
 unsigned long lastMqttReconnectMs = 0;
 bool          mqttDiscoveryPublished = false;
 
+// Radon (Aranet Rn over BLE) configuration (persisted)
+uint16_t radonStaleMin   = RADON_DEFAULT_STALE_MIN;  // hide if no advert this long
+bool     radonInPCi      = false;     // false = Bq/m3, true = pCi/L (display only)
+String   radonTargetMac;              // "" = auto (strongest); else pin this device
+
+// Radon runtime state (the currently-selected device)
+uint16_t      currentRadonBq   = RADON_NONE;
+uint8_t       radonBattery      = 0;
+uint8_t       radonStatusColor  = 0;   // Aranet status: 1 green, 2 yellow, 3 red
+String        radonSrcMac;             // MAC of the selected device
+String        radonSrcName;            // friendly name of the selected device
+unsigned long lastRadonRxMs     = 0;    // millis() of last accepted advert
+bool          radonShownLast    = false; // last drawn availability (for row reflow)
+bool          radonLowBattLast  = false; // last drawn low-battery state
+
+// Seen-device table: every Aranet Rn we hear during scans. Powers the
+// /radon picker, the ble-status command, and the auto-strongest choice.
+struct BleRnDevice {
+  bool          used;
+  char          mac[18];
+  char          name[24];
+  int           rssi;
+  uint16_t      radonBq;
+  uint8_t       battery;
+  uint8_t       status;
+  unsigned long lastSeenMs;
+};
+BleRnDevice bleSeen[BLE_MAX_DEVICES];
+bool          bleScanning   = false;
+bool          bleReady      = false;
+volatile bool bleTableDirty = false;   // set by BLE task, consumed by loop()
+
 // Uptime tracking
 uint32_t baseUptimeSec    = 0;
 uint32_t lastFrcUptimeSec = 0;
@@ -441,14 +511,17 @@ char     lastClockText[12] = "";
 uint16_t co2History[MAX_SAMPLES];     // ppm
 int16_t  tempHistory[MAX_SAMPLES];    // Celsius * 100
 uint16_t rhHistory[MAX_SAMPLES];      // RH * 10
+uint16_t radonHistory[MAX_SAMPLES];   // Bq/m3 (RADON_NONE = no sample)
 int      historyCount = 0;
 int      historyHead  = 0;
 
-// Which metric the on-device graph shows. Cycles on tap.
+// Which metric the on-device graph shows. Cycles on tap. GM_RADON is
+// only included in the cycle when fresh radon data is present.
 enum GraphMode {
-  GM_CO2  = 0,
-  GM_TEMP = 1,
-  GM_RH   = 2,
+  GM_CO2   = 0,
+  GM_TEMP  = 1,
+  GM_RH    = 2,
+  GM_RADON = 3,
 };
 GraphMode graphMode = GM_CO2;
 
@@ -481,9 +554,10 @@ struct LogRecord {
   uint16_t co2_ppm;
   int16_t  temp_c100;    // Celsius * 100
   uint16_t rh_x10;       // RH * 10
+  uint16_t radon_bqm3;   // Bq/m3 (RADON_NONE = no radon at sample time)
 };
 #pragma pack(pop)
-static_assert(sizeof(LogRecord) == 10, "LogRecord must be 10 bytes");
+static_assert(sizeof(LogRecord) == 12, "LogRecord must be 12 bytes");
 static_assert(sizeof(LogHeader) == 28, "LogHeader must be 28 bytes");
 
 // Current readings
@@ -538,10 +612,107 @@ void handleHistoryJson();
 void handleSetHostname();
 void handleMqttPage();
 void handleSetMqtt();
+void handleRadonPage();
+void handleSetRadon();
 void syncNtp(bool blocking);
 void initLog();
-void appendLog(uint16_t co2, float t, float rh);
+void appendLog(uint16_t co2, float t, float rh, uint16_t radonBq);
 void eraseLog();
+
+// ---- Remaining forward declarations ----
+// Building as a .cpp (PlatformIO) instead of a .ino means the Arduino
+// IDE's implicit prototype generation is gone, so every function that is
+// referenced before its definition needs a declaration. (The block above
+// was hand-maintained for the IDE; these are the rest.)
+void logError(const char* context, int16_t err);
+const char* tempUnit();
+void savePref(const char* key, bool v);
+void savePref(const char* key, uint8_t v);
+void savePref(const char* key, uint16_t v);
+void savePref(const char* key, int16_t v);
+void savePref(const char* key, uint32_t v);
+void savePref(const char* key, float v);
+void savePref(const char* key, const String& v);
+void saveUptime();
+uint16_t co2Color(uint16_t co2);
+const char* co2StatusText(uint16_t co2);
+const char* co2StatusKey(uint16_t co2);
+float displayTemp();
+float tempOffsetDisplay();
+float roundDownToF(float v, float step);
+float roundUpToF(float v, float step);
+float getSampleValue(int idx, GraphMode m);
+float getCurrentValue(GraphMode m);
+bool recomputeChartBounds();
+int valueToY(float v);
+uint32_t getTotalUptimeSec();
+uint32_t daysSinceLastFrc();
+bool calibrationOverdue();
+int co2Trend();
+void hourStats(uint16_t& mn, uint16_t& mx, uint16_t& avg);
+void disableOnboardLeds();
+String deviceSuffix();
+void setupBacklight();
+void sampleLdr();
+void writeBacklightDuty(uint8_t pct);
+void applyBrightness();
+void serviceAutoBrightness();
+void changeBrightness();
+void loadPrefs();
+void saveHistory();
+void saveUptimePeriodic();
+void resetPrefs();
+void writeLogHeader();
+template<class F> void iterateLog(F callback);
+bool readTap(int16_t& sx, int16_t& sy);
+void drawTrendArrow(int cx, int cy, int trend, uint16_t color);
+void formatClock(char* buf, size_t bufsize);
+void formatAxisLabel(char* buf, size_t bufsize, float v);
+const char* graphCaption();
+uint16_t plotColor(float v);
+void drawThresholdLines();
+void drawGraphFrame();
+void drawWifiSetupHeader();
+void drawWifiSetupStatus(const char* state, uint16_t color);
+void formatHourLabel(char* buf, size_t bufSize, int8_t h);
+template<class Fn> int16_t withChipIdle(Fn fn);
+void changeAltitude(int16_t delta);
+void changeTempOffset(int direction);
+void changeTimezone(int delta);
+void handleTouch();
+void initSensor();
+bool readSensor();
+void addGraphSample(uint16_t co2, float t_c, float rh, uint16_t radonBq);
+void serviceNtp();
+// Radon (Aranet Rn over BLE) helpers, defined in the RADON section but
+// referenced earlier by the graph/display/web code.
+bool radonAvailable();
+bool radonLowBattery();
+float radonToDisplay(uint16_t bq);
+float radonDisplayValue();
+const char* radonUnitStr();
+const char* radonUnitShortStr();
+uint16_t radonColor(uint16_t bq);
+void radonSelectActive();
+void serviceBleScan();
+void setupBle();
+static bool isValidHostname(const String& s);
+void restartMdns();
+void serviceWifiPortal();
+String mqttTopic(const char* sub);
+String mqttBuildStatePayload();
+void mqttPublishDiscovery();
+bool mqttTryConnect();
+void mqttPublishReadings();
+void serviceMqtt();
+String escapeHtml(const String& s);
+void doFRCSerial(uint16_t target);
+void setAscFromSerial(bool enable);
+void wifiResetSerial();
+void wifiStatusSerial();
+void bleStatusSerial();
+void printInfo();
+void handleSerialCommands();
 
 // ============================================================
 //                     HELPERS
@@ -600,6 +771,10 @@ float getSampleValue(int idx, GraphMode m) {
       return tempInFahrenheit ? (c * 9.0f / 5.0f + 32.0f) : c;
     }
     case GM_RH:   return rhHistory[idx] / 10.0f;
+    case GM_RADON:
+      // Sentinel slots (before radon was available) plot as a gap.
+      return radonHistory[idx] == RADON_NONE ? NAN
+                                             : radonToDisplay(radonHistory[idx]);
     case GM_CO2:
     default:      return (float)co2History[idx];
   }
@@ -611,6 +786,7 @@ float getCurrentValue(GraphMode m) {
       return tempInFahrenheit ? (currentTemp * 9.0f / 5.0f + 32.0f)
                               : currentTemp;
     case GM_RH:   return currentRH;
+    case GM_RADON: return radonAvailable() ? radonDisplayValue() : NAN;
     case GM_CO2:
     default:      return (float)currentCO2;
   }
@@ -626,6 +802,10 @@ void getMetricDefaults(GraphMode m, float& dMin, float& dMax,
       break;
     case GM_RH:
       dMin = 30; dMax = 70; step = 10; minSpan = 20;
+      break;
+    case GM_RADON:
+      if (radonInPCi) { dMin = 0; dMax = 6;   step = 2;  minSpan = 4;   }
+      else            { dMin = 0; dMax = 200; step = 50; minSpan = 100; }
       break;
     case GM_CO2:
     default:
@@ -644,12 +824,15 @@ bool recomputeChartBounds() {
 
   if (dataValid) {
     float cur = getCurrentValue(graphMode);
-    if (cur < newMin) newMin = cur;
-    if (cur > newMax) newMax = cur;
+    if (!isnan(cur)) {
+      if (cur < newMin) newMin = cur;
+      if (cur > newMax) newMax = cur;
+    }
   }
   for (int i = 0; i < historyCount; i++) {
     int idx = (historyHead - historyCount + i + MAX_SAMPLES) % MAX_SAMPLES;
     float v = getSampleValue(idx, graphMode);
+    if (isnan(v)) continue;   // radon gap
     if (v < newMin) newMin = v;
     if (v > newMax) newMax = v;
   }
@@ -905,6 +1088,16 @@ void loadPrefs() {
   mqttDiscoveryPrefix  = prefs.getString("mqDiscPfx", "homeassistant");
   if (mqttDiscoveryPrefix.length() == 0) mqttDiscoveryPrefix = "homeassistant";
 
+  // Radon (Aranet Rn) configuration.
+  radonStaleMin  = prefs.getUShort("rdnstale", RADON_DEFAULT_STALE_MIN);
+  if (radonStaleMin == 0) radonStaleMin = RADON_DEFAULT_STALE_MIN;
+  radonInPCi     = prefs.getBool  ("rdnpci",   false);
+  radonTargetMac = prefs.getString("rdnmac",   "");
+
+  // The radon ring has no "valid" companion array; it uses an in-band
+  // sentinel, so it must start filled with RADON_NONE (not zeroed).
+  for (int i = 0; i < MAX_SAMPLES; i++) radonHistory[i] = RADON_NONE;
+
   // In-RAM history copies (for graph at boot if cached)
   size_t bytesAvail = prefs.getBytesLength("hist");
   if (bytesAvail == sizeof(co2History)) {
@@ -914,7 +1107,7 @@ void loadPrefs() {
     if (historyCount > MAX_SAMPLES) historyCount = MAX_SAMPLES;
     if (historyHead  >= MAX_SAMPLES) historyHead  = 0;
   }
-  // Temp / RH buffers added later than CO2; missing on older NVS
+  // Temp / RH / radon buffers added later than CO2; missing on older NVS
   // is harmless - they will fill in as new samples arrive.
   if (prefs.getBytesLength("histT") == sizeof(tempHistory)) {
     prefs.getBytes("histT", tempHistory, sizeof(tempHistory));
@@ -922,8 +1115,11 @@ void loadPrefs() {
   if (prefs.getBytesLength("histH") == sizeof(rhHistory)) {
     prefs.getBytes("histH", rhHistory, sizeof(rhHistory));
   }
+  if (prefs.getBytesLength("histR") == sizeof(radonHistory)) {
+    prefs.getBytes("histR", radonHistory, sizeof(radonHistory));
+  }
   graphMode = (GraphMode) prefs.getUChar("gmode", GM_CO2);
-  if (graphMode > GM_RH) graphMode = GM_CO2;
+  if (graphMode > GM_RADON) graphMode = GM_CO2;
   prefs.end();
 
   Serial.printf("Loaded: alt=%u toff=%.1f tempF=%d tz=%d 24h=%d hist=%d uptime=%lu frc_at=%lu\n",
@@ -942,9 +1138,10 @@ void savePref(const char* key, const String& v) { prefs.begin("co2mon", false); 
 
 void saveHistory() {
   prefs.begin("co2mon", false);
-  prefs.putBytes ("hist",   co2History,  sizeof(co2History));
-  prefs.putBytes ("histT",  tempHistory, sizeof(tempHistory));
-  prefs.putBytes ("histH",  rhHistory,   sizeof(rhHistory));
+  prefs.putBytes ("hist",   co2History,   sizeof(co2History));
+  prefs.putBytes ("histT",  tempHistory,  sizeof(tempHistory));
+  prefs.putBytes ("histH",  rhHistory,    sizeof(rhHistory));
+  prefs.putBytes ("histR",  radonHistory, sizeof(radonHistory));
   prefs.putUShort("histcnt", historyCount);
   prefs.putUShort("histhd",  historyHead);
   prefs.end();
@@ -1025,14 +1222,15 @@ void initLog() {
                 (unsigned long)LOG_MAX_RECORDS);
 }
 
-void appendLog(uint16_t co2, float t, float rh) {
+void appendLog(uint16_t co2, float t, float rh, uint16_t radonBq) {
   if (!fsReady) return;
 
   LogRecord rec;
-  rec.ts_utc   = ntpSynced ? (uint32_t)time(nullptr) : 0;
-  rec.co2_ppm  = co2;
-  rec.temp_c100 = (int16_t)(t * 100.0f);
-  rec.rh_x10    = (uint16_t)(rh * 10.0f);
+  rec.ts_utc     = ntpSynced ? (uint32_t)time(nullptr) : 0;
+  rec.co2_ppm    = co2;
+  rec.temp_c100  = (int16_t)(t * 100.0f);
+  rec.rh_x10     = (uint16_t)(rh * 10.0f);
+  rec.radon_bqm3 = radonBq;
 
   File f = LittleFS.open(LOG_PATH, "r+");
   if (!f) { Serial.println("LOG: append open failed"); return; }
@@ -1249,6 +1447,8 @@ void drawClockRow(bool force) {
 void formatAxisLabel(char* buf, size_t bufsize, float v) {
   if (graphMode == GM_TEMP) {
     snprintf(buf, bufsize, "%.0f", v);
+  } else if (graphMode == GM_RADON && radonInPCi) {
+    snprintf(buf, bufsize, "%.1f", v);   // pCi/L range is small (0-6)
   } else {
     snprintf(buf, bufsize, "%d", (int)(v + 0.5f));
   }
@@ -1261,6 +1461,9 @@ const char* graphCaption() {
                               : "Temp C  -  5 min/sample";
     case GM_RH:
       return "Humidity %  -  5 min/sample";
+    case GM_RADON:
+      return radonInPCi ? "Radon pCi/L  -  5 min/sample"
+                        : "Radon Bq/m3  -  5 min/sample";
     case GM_CO2:
     default:
       return "CO2 ppm  -  5 min/sample";
@@ -1273,6 +1476,11 @@ uint16_t plotColor(float v) {
       return co2Color((uint16_t)v);
     case GM_TEMP:
       return TFT_ORANGE;     // warm metric -> warm color
+    case GM_RADON: {
+      // v is in display units; colour by the underlying Bq/m3 thresholds.
+      uint16_t bq = (uint16_t)(radonInPCi ? v * BQ_PER_PCIL : v);
+      return radonColor(bq);
+    }
     case GM_RH:
     default:
       return TFT_SKYBLUE;
@@ -1303,6 +1511,19 @@ void drawThresholdLines() {
         int y = valueToY(bands[i]);
         for (int x = GRAPH_X + 2; x < GRAPH_X + GRAPH_W; x += 4)
           tft.drawPixel(x, y, cMid);
+      }
+    }
+  } else if (graphMode == GM_RADON) {
+    // Radon: dashed lines at WHO (100) and EPA-4pCi/L (148) Bq/m3,
+    // converted to the active display unit.
+    float bands[2] = {radonToDisplay(RADON_ZONE_MOD_BQ),
+                      radonToDisplay(RADON_ZONE_HIGH_BQ)};
+    uint16_t cols[2] = {0x4225, TFT_RED};
+    for (int i = 0; i < 2; i++) {
+      if (bands[i] > chartMin && bands[i] < chartMax) {
+        int y = valueToY(bands[i]);
+        for (int x = GRAPH_X + 2; x < GRAPH_X + GRAPH_W; x += 4)
+          tft.drawPixel(x, y, cols[i]);
       }
     }
   }
@@ -1339,6 +1560,15 @@ void drawGraphFrame() {
       tft.drawString("60",  GRAPH_X - 2, valueToY(60.0f), 1);
     if (30.0f > chartMin && 30.0f < chartMax)
       tft.drawString("30",  GRAPH_X - 2, valueToY(30.0f), 1);
+  } else if (graphMode == GM_RADON) {
+    float bands[2] = {radonToDisplay(RADON_ZONE_HIGH_BQ),
+                      radonToDisplay(RADON_ZONE_MOD_BQ)};
+    for (int i = 0; i < 2; i++) {
+      if (bands[i] > chartMin && bands[i] < chartMax) {
+        formatAxisLabel(buf, sizeof(buf), bands[i]);
+        tft.drawString(buf, GRAPH_X - 2, valueToY(bands[i]), 1);
+      }
+    }
   }
 
   tft.setTextDatum(TR_DATUM);
@@ -1346,6 +1576,13 @@ void drawGraphFrame() {
 }
 
 void drawGraph() {
+  // If radon went stale while we were viewing it, fall back to CO2 so
+  // the graph never sits on an empty metric.
+  if (graphMode == GM_RADON && !radonAvailable()) {
+    graphMode = GM_CO2;
+    drawGraphFrame();
+  }
+
   // Adjust y-axis bounds to fit the current data; if they changed,
   // we need to redraw the gutter labels too.
   bool boundsChanged = recomputeChartBounds();
@@ -1360,6 +1597,7 @@ void drawGraph() {
   for (int i = 0; i < historyCount; i++) {
     int idx = (historyHead - historyCount + i + MAX_SAMPLES) % MAX_SAMPLES;
     float v = getSampleValue(idx, graphMode);
+    if (isnan(v)) { prevX = -1; continue; }   // radon gap: break the line
     int x = GRAPH_X + 2 + (int)(i * dx);
     int y = valueToY(v);
     uint16_t c = plotColor(v);
@@ -1372,6 +1610,76 @@ void drawGraph() {
 // ============================================================
 //                      READINGS
 // ============================================================
+
+// Bottom-row layout: 2 columns (Temp | RH) normally, or 3 columns
+// (Temp | RH | Radon) when fresh radon data is present. Returns the
+// column count and the three column centers (c2 unused when 2 columns).
+void bottomColCenters(int& n, int& c0, int& c1, int& c2) {
+  if (radonAvailable()) { n = 3; c0 = 40; c1 = 120; c2 = 200; }
+  else                  { n = 2; c0 = SCREEN_W / 4; c1 = SCREEN_W * 3 / 4; c2 = -1; }
+}
+
+// Tiny "low battery" glyph (~13x7) for the radon column header.
+void drawBatteryIcon(int x, int y, uint16_t color) {
+  tft.drawRect(x, y, 11, 7, color);
+  tft.fillRect(x + 11, y + 2, 2, 3, color);
+  tft.fillRect(x + 2, y + 2, 3, 3, color);   // a stub "low" bar
+}
+
+// Bottom-row LABELS (Temp/RH[/Radon]). Redrawn on layout change.
+void drawBottomLabels() {
+  int n, c0, c1, c2;
+  bottomColCenters(n, c0, c1, c2);
+  tft.fillRect(0, TR_TOP, SCREEN_W, 14, COLOR_BG);
+  tft.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+  tft.setTextDatum(TC_DATUM);
+  tft.drawString("TEMP", c0, TR_TOP, 2);
+  tft.drawString("RH",   c1, TR_TOP, 2);
+  if (n == 3) {
+    tft.drawString("RADON", c2, TR_TOP, 2);
+    if (radonLowBattery()) drawBatteryIcon(c2 + 28, TR_TOP + 1, TFT_ORANGE);
+  }
+  radonShownLast   = (n == 3);
+  radonLowBattLast = radonLowBattery();
+}
+
+// Bottom-row VALUES (Temp/RH[/Radon]). Radon is coloured by zone.
+void drawBottomValues() {
+  char buf[16];
+  int n, c0, c1, c2;
+  bottomColCenters(n, c0, c1, c2);
+  tft.fillRect(0, TR_VALUE_Y, SCREEN_W, 30, COLOR_BG);
+
+  // Temp
+  tft.setTextColor(COLOR_TEXT, COLOR_BG);
+  tft.setTextDatum(TC_DATUM);
+  snprintf(buf, sizeof(buf), "%.1f", displayTemp());
+  tft.drawString(buf, c0 - 6, TR_VALUE_Y, 4);
+  tft.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+  tft.setTextDatum(TL_DATUM);
+  tft.drawString(tempUnit(), c0 + (n == 3 ? 20 : 30), TR_VALUE_Y + 4, 2);
+
+  // RH
+  tft.setTextColor(COLOR_TEXT, COLOR_BG);
+  tft.setTextDatum(TC_DATUM);
+  snprintf(buf, sizeof(buf), "%.0f", currentRH);
+  tft.drawString(buf, c1 - 6, TR_VALUE_Y, 4);
+  tft.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+  tft.setTextDatum(TL_DATUM);
+  tft.drawString("%", c1 + (n == 3 ? 14 : 18), TR_VALUE_Y + 4, 2);
+
+  // Radon (only when present)
+  if (n == 3) {
+    tft.setTextColor(radonColor(currentRadonBq), COLOR_BG);
+    tft.setTextDatum(TC_DATUM);
+    if (radonInPCi) snprintf(buf, sizeof(buf), "%.1f", radonDisplayValue());
+    else            snprintf(buf, sizeof(buf), "%.0f", radonDisplayValue());
+    tft.drawString(buf, c2 - 10, TR_VALUE_Y, 4);
+    tft.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
+    tft.setTextDatum(TL_DATUM);
+    tft.drawString(radonUnitShortStr(), c2 + 20, TR_VALUE_Y + 5, 1);
+  }
+}
 
 void drawReadings() {
   char buf[16];
@@ -1405,25 +1713,12 @@ void drawReadings() {
   tft.setTextDatum(TC_DATUM);
   tft.drawString(co2StatusText(currentCO2), SCREEN_W / 2, STATUS_Y, 4);
 
-  // Temp
-  tft.fillRect(0, TR_VALUE_Y, SCREEN_W / 2, 30, COLOR_BG);
-  tft.setTextColor(COLOR_TEXT, COLOR_BG);
-  tft.setTextDatum(TC_DATUM);
-  snprintf(buf, sizeof(buf), "%.1f", displayTemp());
-  tft.drawString(buf, SCREEN_W / 4 - 6, TR_VALUE_Y, 4);
-  tft.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
-  tft.setTextDatum(TL_DATUM);
-  tft.drawString(tempUnit(), SCREEN_W / 4 + 30, TR_VALUE_Y + 4, 2);
-
-  // RH
-  tft.fillRect(SCREEN_W / 2, TR_VALUE_Y, SCREEN_W / 2, 30, COLOR_BG);
-  tft.setTextColor(COLOR_TEXT, COLOR_BG);
-  tft.setTextDatum(TC_DATUM);
-  snprintf(buf, sizeof(buf), "%.0f", currentRH);
-  tft.drawString(buf, SCREEN_W * 3 / 4 - 6, TR_VALUE_Y, 4);
-  tft.setTextColor(COLOR_TEXT_DIM, COLOR_BG);
-  tft.setTextDatum(TL_DATUM);
-  tft.drawString("%", SCREEN_W * 3 / 4 + 18, TR_VALUE_Y + 4, 2);
+  // Bottom row. When radon (dis)appears or its battery state flips, the
+  // labels must be redrawn for the 2 <-> 3 column reflow.
+  if (radonAvailable() != radonShownLast || radonLowBattery() != radonLowBattLast) {
+    drawBottomLabels();
+  }
+  drawBottomValues();
 }
 
 // ============================================================
@@ -1440,9 +1735,7 @@ void drawMainScreen() {
   tft.setTextDatum(MC_DATUM);
   tft.drawString("CO2 (ppm)", SCREEN_W / 2, CO2_LABEL_Y, 2);
 
-  tft.setTextDatum(TC_DATUM);
-  tft.drawString("TEMP", SCREEN_W / 4,     TR_TOP, 2);
-  tft.drawString("RH",   SCREEN_W * 3 / 4, TR_TOP, 2);
+  drawBottomLabels();   // TEMP | RH [| RADON]
 
   // Compute bounds before the frame so the labels match the data
   // we are about to plot.
@@ -2148,9 +2441,20 @@ void handleTouch() {
         drawGraphFrame();
         drawGraph();
       }
+    } else if (btnRadon.contains(x, y) && radonAvailable()) {
+      // Toggle radon units Bq/m3 <-> pCi/L
+      radonInPCi = !radonInPCi;
+      savePref("rdnpci", radonInPCi);
+      drawBottomValues();
+      if (graphMode == GM_RADON) {
+        recomputeChartBounds();
+        drawGraphFrame();
+        drawGraph();
+      }
     } else if (btnGraph.contains(x, y)) {
-      // Cycle CO2 -> Temp -> RH -> CO2
-      graphMode = (GraphMode)((graphMode + 1) % 3);
+      // Cycle CO2 -> Temp -> RH -> (Radon if present) -> CO2
+      graphMode = (GraphMode)((graphMode + 1) % 4);
+      if (graphMode == GM_RADON && !radonAvailable()) graphMode = GM_CO2;
       savePref("gmode", (uint8_t)graphMode);
       // Force a frame redraw because labels and caption changed
       recomputeChartBounds();
@@ -2248,13 +2552,166 @@ bool readSensor() {
   return true;
 }
 
-void addGraphSample(uint16_t co2, float t_c, float rh) {
-  co2History[historyHead]  = co2;
-  tempHistory[historyHead] = (int16_t)(t_c * 100.0f);
-  rhHistory[historyHead]   = (uint16_t)(rh * 10.0f);
+void addGraphSample(uint16_t co2, float t_c, float rh, uint16_t radonBq) {
+  co2History[historyHead]   = co2;
+  tempHistory[historyHead]  = (int16_t)(t_c * 100.0f);
+  rhHistory[historyHead]    = (uint16_t)(rh * 10.0f);
+  radonHistory[historyHead] = radonBq;
   historyHead = (historyHead + 1) % MAX_SAMPLES;
   if (historyCount < MAX_SAMPLES) historyCount++;
   saveHistory();
+}
+
+// ============================================================
+//                  RADON (Aranet Rn over BLE)
+// ============================================================
+
+// True when we have a fresh radon reading from the selected device.
+bool radonAvailable() {
+  if (currentRadonBq == RADON_NONE) return false;
+  return (millis() - lastRadonRxMs) < (unsigned long)radonStaleMin * 60000UL;
+}
+
+bool radonLowBattery() {
+  return radonAvailable() && radonBattery > 0 && radonBattery <= RADON_BATT_LOW;
+}
+
+// Convert a stored Bq/m3 value to the active display unit.
+float radonToDisplay(uint16_t bq) {
+  return radonInPCi ? (bq / BQ_PER_PCIL) : (float)bq;
+}
+float radonDisplayValue() { return radonToDisplay(currentRadonBq); }
+const char* radonUnitStr()      { return radonInPCi ? "pCi/L" : "Bq/m3"; }
+const char* radonUnitShortStr() { return radonInPCi ? "pCi"   : "Bq"; }
+
+// Zone colour for the radon number / plot, by Bq/m3 thresholds.
+uint16_t radonColor(uint16_t bq) {
+  if (bq == RADON_NONE)            return COLOR_TEXT;
+  if (bq >= RADON_ZONE_HIGH_BQ)    return TFT_RED;
+  if (bq >= RADON_ZONE_MOD_BQ)     return TFT_ORANGE;
+  return TFT_GREEN;
+}
+
+// --- Seen-device table helpers ---
+
+// Drop devices we have not heard from within the staleness window.
+void radonAgeOutDevices() {
+  unsigned long ttl = (unsigned long)radonStaleMin * 60000UL;
+  for (int i = 0; i < BLE_MAX_DEVICES; i++) {
+    if (bleSeen[i].used && (millis() - bleSeen[i].lastSeenMs) > ttl) {
+      bleSeen[i].used = false;
+    }
+  }
+}
+
+// Insert/update a device in the seen table (keyed by MAC).
+void radonUpsertDevice(const char* mac, const char* name, int rssi,
+                       uint16_t bq, uint8_t batt, uint8_t status) {
+  int slot = -1, oldest = -1;
+  unsigned long oldestMs = 0xFFFFFFFF;
+  for (int i = 0; i < BLE_MAX_DEVICES; i++) {
+    if (bleSeen[i].used && strcmp(bleSeen[i].mac, mac) == 0) { slot = i; break; }
+    if (!bleSeen[i].used && slot < 0) slot = i;
+    if (bleSeen[i].used && bleSeen[i].lastSeenMs < oldestMs) {
+      oldestMs = bleSeen[i].lastSeenMs; oldest = i;
+    }
+  }
+  if (slot < 0) slot = oldest;            // table full: evict the stalest
+  if (slot < 0) return;
+  BleRnDevice& d = bleSeen[slot];
+  d.used = true;
+  strncpy(d.mac, mac, sizeof(d.mac) - 1);   d.mac[sizeof(d.mac) - 1]   = '\0';
+  if (name && name[0]) { strncpy(d.name, name, sizeof(d.name) - 1); d.name[sizeof(d.name) - 1] = '\0'; }
+  else if (!d.name[0]) d.name[0] = '\0';
+  d.rssi = rssi; d.radonBq = bq; d.battery = batt; d.status = status;
+  d.lastSeenMs = millis();
+}
+
+// Pick the active device: the pinned MAC if present & fresh, else the
+// strongest-RSSI fresh device. Copies its values into the radon globals.
+void radonSelectActive() {
+  radonAgeOutDevices();
+  int best = -1;
+  for (int i = 0; i < BLE_MAX_DEVICES; i++) {
+    if (!bleSeen[i].used) continue;
+    if (radonTargetMac.length()) {
+      if (radonTargetMac.equalsIgnoreCase(bleSeen[i].mac)) { best = i; break; }
+      continue;
+    }
+    if (best < 0 || bleSeen[i].rssi > bleSeen[best].rssi) best = i;
+  }
+  if (best < 0) return;   // nothing matching (pinned device out of range)
+  BleRnDevice& d = bleSeen[best];
+  currentRadonBq   = d.radonBq;
+  radonBattery     = d.battery;
+  radonStatusColor = d.status;
+  radonSrcMac      = d.mac;
+  radonSrcName     = d.name;
+  lastRadonRxMs    = d.lastSeenMs;
+}
+
+// Parse one advertisement; returns true if it was an Aranet Rn we accepted.
+bool radonParseAdvert(NimBLEAdvertisedDevice* dev) {
+  std::string md = dev->getManufacturerData();
+  if (md.size() < ARANET_MFG_MIN_LEN) return false;
+  const uint8_t* b = (const uint8_t*)md.data();
+  if (b[0] != (ARANET_COMPANY_ID & 0xFF)) return false;   // 0x02
+  if (b[1] != (ARANET_COMPANY_ID >> 8))   return false;   // 0x07
+  if (b[2] != ARANET_TYPE_RADON)          return false;   // radon device
+  uint16_t bq = b[RADON_OFF_VALUE] | (b[RADON_OFF_VALUE + 1] << 8);
+  if (bq >= RADON_INVALID_MIN) return false;              // invalid reading
+  uint8_t batt   = b[RADON_OFF_BATTERY];
+  uint8_t status = b[RADON_OFF_STATUS];
+  std::string nm = dev->getName();
+  radonUpsertDevice(dev->getAddress().toString().c_str(),
+                    nm.c_str(), dev->getRSSI(), bq, batt, status);
+  return true;
+}
+
+// Advertisement callback. Runs on the NimBLE task during a scan, so it must
+// NOT touch the String selection globals (that happens on the main task via
+// the bleTableDirty flag). It only updates the seen-device table.
+class RadonScanCallbacks : public NimBLEAdvertisedDeviceCallbacks {
+  void onResult(NimBLEAdvertisedDevice* dev) override {
+    if (radonParseAdvert(dev)) bleTableDirty = true;
+  }
+};
+RadonScanCallbacks radonScanCallbacks;
+
+void bleScanComplete(NimBLEScanResults results) {
+  bleScanning   = false;
+  bleTableDirty = true;   // re-select on the main task after the scan
+}
+
+void setupBle() {
+  NimBLEDevice::init("");
+  NimBLEDevice::setPower(ESP_PWR_LVL_P9);
+  NimBLEScan* s = NimBLEDevice::getScan();
+  s->setAdvertisedDeviceCallbacks(&radonScanCallbacks, /*wantDuplicates=*/true);
+  s->setActiveScan(true);     // active = also pull scan-response friendly name
+  s->setInterval(100);
+  s->setWindow(99);
+  bleReady = true;
+  Serial.println("BLE: NimBLE scanner ready");
+}
+
+// Periodic loop hook: kick a short non-blocking scan every BLE_SCAN_PERIOD_MS.
+// Runs on the main task, so this is where the active-device selection (which
+// touches String globals) happens - never in the BLE callback.
+void serviceBleScan() {
+  if (!bleReady) return;
+  if (bleTableDirty) { bleTableDirty = false; radonSelectActive(); }
+  if (bleScanning) return;
+  static unsigned long lastScanMs = 0;
+  unsigned long now = millis();
+  if (lastScanMs != 0 && (now - lastScanMs) < BLE_SCAN_PERIOD_MS) return;
+  lastScanMs = now;
+  bleScanning = true;
+  NimBLEScan* s = NimBLEDevice::getScan();
+  s->clearResults();
+  if (!s->start(BLE_SCAN_SECS, bleScanComplete, false)) {
+    bleScanning = false;   // start failed; try again next period
+  }
 }
 
 // ============================================================
@@ -2449,6 +2906,11 @@ String mqttBuildStatePayload() {
   j += ",";
   j += "\"rh\":";     j += String(currentRH, 1);          j += ",";
   j += "\"status\":\""; j += co2StatusKey(currentCO2);    j += "\"";
+  // Radon only when a fresh reading exists (HA keeps last value otherwise).
+  if (radonAvailable()) {
+    j += ",\"radon\":";         j += String(currentRadonBq);
+    j += ",\"radon_battery\":"; j += String(radonBattery);
+  }
   j += "}";
   return j;
 }
@@ -2498,7 +2960,12 @@ void mqttPublishDiscovery() {
      tempInFahrenheit ? "\\u00b0F" : "\\u00b0C", "measurement",
      tempInFahrenheit ? "{{ value_json.temp_f }}" : "{{ value_json.temp_c }}"},
     {"rh",     "Humidity",    "humidity",       "%",   "measurement",
-     "{{ value_json.rh }}"}
+     "{{ value_json.rh }}"},
+    // Radon has no standard HA device_class - leave it empty (omitted below).
+    {"radon",      "Radon",         "",        "Bq/m\\u00b3", "measurement",
+     "{{ value_json.radon }}"},
+    {"radon_batt", "Radon Battery", "battery", "%",           "measurement",
+     "{{ value_json.radon_battery }}"}
   };
   for (auto& s : sensors) {
     String topic = mqttDiscoveryPrefix + "/sensor/" + nodeSafe + "/"
@@ -2507,7 +2974,8 @@ void mqttPublishDiscovery() {
     payload += "\"name\":\""   + String(s.name)         + "\",";
     payload += "\"uniq_id\":\""+ nodeSafe + "_" + s.key + "\",";
     payload += "\"stat_t\":\"" + stateTopic             + "\",";
-    payload += "\"dev_cla\":\""+ String(s.device_class) + "\",";
+    if (s.device_class[0])
+      payload += "\"dev_cla\":\""+ String(s.device_class) + "\",";
     payload += "\"unit_of_meas\":\"" + String(s.unit)   + "\",";
     payload += "\"stat_cla\":\""+ String(s.state_class) + "\",";
     payload += "\"val_tpl\":\"" + String(s.value_tmpl)  + "\",";
@@ -2573,6 +3041,13 @@ void mqttPublishReadings() {
 
   mqttClient.publish(mqttTopic("status").c_str(), co2StatusKey(currentCO2));
 
+  if (radonAvailable()) {
+    snprintf(buf, sizeof(buf), "%u", currentRadonBq);
+    mqttClient.publish(mqttTopic("radon").c_str(), buf);
+    snprintf(buf, sizeof(buf), "%u", radonBattery);
+    mqttClient.publish(mqttTopic("radon_battery").c_str(), buf);
+  }
+
   // JSON state for HA discovery consumers
   String state = mqttBuildStatePayload();
   mqttClient.publish(mqttTopic("state").c_str(), state.c_str());
@@ -2606,6 +3081,8 @@ void startWebServer() {
   server.on("/sethostname",  HTTP_POST, handleSetHostname);
   server.on("/mqtt",         handleMqttPage);
   server.on("/setmqtt",      HTTP_POST, handleSetMqtt);
+  server.on("/radon",        handleRadonPage);
+  server.on("/setradon",     HTTP_POST, handleSetRadon);
   server.onNotFound([](){ server.send(404, "text/plain", "Not found"); });
   ElegantOTA.begin(&server);    // adds /update endpoint
   server.begin();
@@ -2697,6 +3174,15 @@ void handleRoot() {
               "<div class='value'>");
     html += buf; html += F("</div></div>");
 
+    if (radonAvailable()) {
+      if (radonInPCi) snprintf(buf, sizeof(buf), "%.1f %s", radonDisplayValue(), radonUnitStr());
+      else            snprintf(buf, sizeof(buf), "%u %s", currentRadonBq, radonUnitStr());
+      html += F("<div class='tile'><div class='label'>Radon");
+      if (radonLowBattery()) html += F(" (low battery)");
+      html += F("</div><div class='value'>");
+      html += buf; html += F("</div></div>");
+    }
+
     uint16_t mn, mx, avg;
     hourStats(mn, mx, avg);
     if (avg > 0) {
@@ -2726,7 +3212,8 @@ void handleRoot() {
     html += F(" days old. Consider running Force Recalibrate outdoors.</div>");
   }
 
-  // Three chart containers: CO2, Temperature, Humidity
+  // Chart containers: CO2, Temperature, Humidity, and (when present) Radon.
+  // The radon section is hidden until the chart script confirms data.
   html += F("<h2>Recent CO2</h2>"
             "<div class='chart-wrap'>"
             "<canvas id='cCO2' height='220'></canvas></div>"
@@ -2735,14 +3222,19 @@ void handleRoot() {
             "<canvas id='cTemp' height='180'></canvas></div>"
             "<h2>Recent Humidity</h2>"
             "<div class='chart-wrap'>"
-            "<canvas id='cRH' height='180'></canvas></div>");
+            "<canvas id='cRH' height='180'></canvas></div>"
+            "<div id='radonSection' style='display:none'>"
+            "<h2 id='radonHdr'>Recent Radon</h2>"
+            "<div class='chart-wrap'>"
+            "<canvas id='cRadon' height='180'></canvas></div></div>");
 
   // Actions
   html += F("<div class='actions'>"
             "<a href='/history.csv' download>Download Full CSV</a> "
             "<a href='/data.json'>JSON</a> "
             "<a href='/update'>Firmware Update</a> "
-            "<a href='/mqtt'>MQTT Setup</a>"
+            "<a href='/mqtt'>MQTT Setup</a> "
+            "<a href='/radon'>Radon Setup</a>"
             "</div>");
 
   // Sample count info
@@ -2793,6 +3285,12 @@ void handleRoot() {
             "  mk('cCO2','CO2 ppm',d.co2,'#6cf',400,1500);"
             "  mk('cTemp','Temp '+d.temp_unit,d.temp,'#fa3',null,null);"
             "  mk('cRH','Humidity %',d.rh,'#9c6',20,80);"
+            "  if(d.radon&&d.radon.some(v=>v!==null)){"
+            "    document.getElementById('radonSection').style.display='block';"
+            "    document.getElementById('radonHdr').textContent="
+            "      'Recent Radon ('+d.radon_unit+')';"
+            "    mk('cRadon','Radon '+d.radon_unit,d.radon,'#c9f',0,null);"
+            "  }"
             "});"
             "setTimeout(()=>location.reload(),60000);"
             "</script>");
@@ -2824,6 +3322,18 @@ void handleData() {
   j += "\"log_count\":";  j += String(logHdr.count); j += ",";
   j += "\"log_capacity\":"; j += String(logHdr.capacity); j += ",";
   j += "\"unix_time\":";  j += String((uint32_t)(ntpSynced ? time(nullptr) : 0));
+  // Radon (Aranet Rn over BLE). Present only when a fresh reading exists.
+  bool radv = radonAvailable();
+  j += ",\"radon_valid\":"; j += (radv ? "true" : "false");
+  j += ",\"radon_unit\":\""; j += radonUnitStr(); j += "\"";
+  if (radv) {
+    j += ",\"radon_bqm3\":"; j += String(currentRadonBq);
+    j += ",\"radon_pcil\":"; j += String(currentRadonBq / BQ_PER_PCIL, 2);
+    j += ",\"radon_battery\":"; j += String(radonBattery);
+    j += ",\"radon_low_battery\":"; j += (radonLowBattery() ? "true" : "false");
+    j += ",\"radon_age_s\":"; j += String((millis() - lastRadonRxMs) / 1000UL);
+    j += ",\"radon_src\":\""; j += escapeHtml(radonSrcName.length() ? radonSrcName : radonSrcMac); j += "\"";
+  }
   j += "}";
   server.send(200, "application/json", j);
 }
@@ -2834,7 +3344,7 @@ void handleHistoryCsv() {
   server.sendHeader("Content-Disposition", "attachment; filename=co2_history.csv");
   server.send(200, "text/csv", "");
 
-  String header = "timestamp_utc,co2_ppm,temp_c,rh_pct\r\n";
+  String header = "timestamp_utc,co2_ppm,temp_c,rh_pct,radon_bqm3\r\n";
   server.sendContent(header);
 
   if (!fsReady || logHdr.count == 0) return;
@@ -2852,20 +3362,26 @@ void handleHistoryCsv() {
     LogRecord rec;
     if (f.read((uint8_t*)&rec, sizeof(rec)) != sizeof(rec)) break;
 
-    char line[80];
+    // Radon column is blank for samples taken with no radon data (kept
+    // in SI Bq/m3, mirroring temp staying Celsius in the CSV).
+    char rbuf[8];
+    if (rec.radon_bqm3 == RADON_NONE) rbuf[0] = '\0';
+    else snprintf(rbuf, sizeof(rbuf), "%u", rec.radon_bqm3);
+
+    char line[96];
     if (rec.ts_utc != 0) {
       time_t t = (time_t)rec.ts_utc;
       struct tm tmv;
       gmtime_r(&t, &tmv);
       char tbuf[24];
       strftime(tbuf, sizeof(tbuf), "%Y-%m-%dT%H:%M:%SZ", &tmv);
-      snprintf(line, sizeof(line), "%s,%u,%.2f,%.1f\r\n",
+      snprintf(line, sizeof(line), "%s,%u,%.2f,%.1f,%s\r\n",
                tbuf, rec.co2_ppm,
-               rec.temp_c100 / 100.0f, rec.rh_x10 / 10.0f);
+               rec.temp_c100 / 100.0f, rec.rh_x10 / 10.0f, rbuf);
     } else {
-      snprintf(line, sizeof(line), ",%u,%.2f,%.1f\r\n",
+      snprintf(line, sizeof(line), ",%u,%.2f,%.1f,%s\r\n",
                rec.co2_ppm,
-               rec.temp_c100 / 100.0f, rec.rh_x10 / 10.0f);
+               rec.temp_c100 / 100.0f, rec.rh_x10 / 10.0f, rbuf);
     }
     batch += line;
 
@@ -2892,6 +3408,7 @@ void handleHistoryJson() {
   String co2s  = "[";
   String temps = "[";
   String rhs   = "[";
+  String radons = "[";
 
   if (fsReady && n > 0) {
     File f = LittleFS.open(LOG_PATH, "r");
@@ -2907,7 +3424,7 @@ void handleHistoryJson() {
         LogRecord rec;
         if (f.read((uint8_t*)&rec, sizeof(rec)) != sizeof(rec)) break;
         if (i > 0) {
-          times += ","; co2s += ","; temps += ","; rhs += ",";
+          times += ","; co2s += ","; temps += ","; rhs += ","; radons += ",";
         }
         char tbuf[24];
         if (rec.ts_utc != 0) {
@@ -2925,11 +3442,14 @@ void handleHistoryJson() {
         float t_disp = tempInFahrenheit ? (t_c * 9.0f / 5.0f + 32.0f) : t_c;
         temps += String(t_disp, 1);
         rhs   += String(rec.rh_x10 / 10.0f, 1);
+        // Radon in the active display unit; null for samples with no data.
+        if (rec.radon_bqm3 == RADON_NONE) radons += "null";
+        else radons += String(radonToDisplay(rec.radon_bqm3), radonInPCi ? 2 : 0);
       }
       f.close();
     }
   }
-  times += "]"; co2s += "]"; temps += "]"; rhs += "]";
+  times += "]"; co2s += "]"; temps += "]"; rhs += "]"; radons += "]";
 
   String body = "{\"times\":";
   body += times;
@@ -2941,7 +3461,11 @@ void handleHistoryJson() {
   body += tempUnit();
   body += "\",\"rh\":";
   body += rhs;
-  body += "}";
+  body += ",\"radon\":";
+  body += radons;
+  body += ",\"radon_unit\":\"";
+  body += radonUnitStr();
+  body += "\"}";
   server.send(200, "application/json", body);
 }
 
@@ -3160,6 +3684,112 @@ void handleSetMqtt() {
   server.send(303, "text/plain", "Saved");
 }
 
+// ----- Radon (Aranet Rn) configuration page -----
+
+void handleRadonPage() {
+  String html;
+  html.reserve(6000);
+  html += F("<!DOCTYPE html><html><head><meta charset='utf-8'>"
+            "<meta name='viewport' content='width=device-width,initial-scale=1'>"
+            "<title>Radon - CO2 Monitor</title><style>"
+            "body{font-family:system-ui,sans-serif;background:#111;color:#eee;"
+              "margin:0;padding:20px;max-width:640px}"
+            "h1{margin:0 0 16px;border-bottom:1px solid #444;padding-bottom:8px}"
+            "label{display:block;margin:12px 0 4px;color:#bbb}"
+            "input,select{width:100%;padding:8px;background:#222;color:#eee;"
+              "border:1px solid #444;border-radius:4px;box-sizing:border-box}"
+            "button{margin-top:16px;background:#2a4060;color:#cef;border:0;"
+              "padding:10px 20px;border-radius:4px;cursor:pointer;font-size:1em}"
+            ".help{color:#888;font-size:.9em;margin:4px 0}"
+            ".tbl{width:100%;border-collapse:collapse;margin:8px 0}"
+            ".tbl th,.tbl td{text-align:left;padding:4px 8px;"
+              "border-bottom:1px solid #333;font-size:.9em}"
+            "a{color:#9cf}</style></head><body>");
+  html += F("<h1>Radon (Aranet Rn)</h1>");
+
+  if (radonAvailable()) {
+    char b[24];
+    if (radonInPCi) snprintf(b, sizeof(b), "%.1f %s", radonDisplayValue(), radonUnitStr());
+    else            snprintf(b, sizeof(b), "%u %s", currentRadonBq, radonUnitStr());
+    html += F("<p>Current: <b>"); html += b; html += F("</b> from ");
+    html += escapeHtml(radonSrcName.length() ? radonSrcName : radonSrcMac);
+    html += F(" (battery "); html += String(radonBattery); html += F("%)</p>");
+  } else {
+    html += F("<p class='help'>No fresh radon reading. Make sure the Aranet Rn "
+              "has Smart Home Integration enabled and is within range.</p>");
+  }
+
+  // Seen-device table
+  html += F("<h3>Devices seen</h3><table class='tbl'>"
+            "<tr><th>Name</th><th>MAC</th><th>RSSI</th><th>Radon</th><th>Batt</th></tr>");
+  bool any = false;
+  for (int i = 0; i < BLE_MAX_DEVICES; i++) {
+    if (!bleSeen[i].used) continue;
+    any = true;
+    html += F("<tr><td>"); html += escapeHtml(bleSeen[i].name[0] ? bleSeen[i].name : "(unnamed)");
+    html += F("</td><td>"); html += bleSeen[i].mac;
+    html += F("</td><td>"); html += String(bleSeen[i].rssi);
+    html += F("</td><td>"); html += String(bleSeen[i].radonBq); html += F(" Bq");
+    html += F("</td><td>"); html += String(bleSeen[i].battery); html += F("%</td></tr>");
+  }
+  if (!any) html += F("<tr><td colspan='5' style='color:#888'>none yet</td></tr>");
+  html += F("</table>");
+
+  // Settings form
+  html += F("<form method='POST' action='/setradon'>"
+            "<label>Default units</label><select name='unit'>"
+            "<option value='bq'");
+  if (!radonInPCi) html += F(" selected");
+  html += F(">Bq/m3</option><option value='pci'");
+  if (radonInPCi) html += F(" selected");
+  html += F(">pCi/L</option></select>"
+            "<label>Staleness timeout (minutes)</label>"
+            "<input name='stale' type='number' min='1' max='240' value='");
+  html += String(radonStaleMin);
+  html += F("'><p class='help'>Hide radon if no advertisement is received "
+            "within this time (the Rn measures every 10 minutes).</p>"
+            "<label>Target device</label><select name='mac'>"
+            "<option value=''");
+  if (radonTargetMac.length() == 0) html += F(" selected");
+  html += F(">Auto (strongest signal)</option>");
+  bool pinnedSeen = false;
+  for (int i = 0; i < BLE_MAX_DEVICES; i++) {
+    if (!bleSeen[i].used) continue;
+    html += F("<option value='"); html += bleSeen[i].mac; html += F("'");
+    if (radonTargetMac.equalsIgnoreCase(bleSeen[i].mac)) { html += F(" selected"); pinnedSeen = true; }
+    html += F(">");
+    html += escapeHtml(bleSeen[i].name[0] ? bleSeen[i].name : bleSeen[i].mac);
+    html += F(" ("); html += bleSeen[i].mac; html += F(")</option>");
+  }
+  if (radonTargetMac.length() && !pinnedSeen) {
+    html += F("<option value='"); html += escapeHtml(radonTargetMac);
+    html += F("' selected>"); html += escapeHtml(radonTargetMac);
+    html += F(" (not in range)</option>");
+  }
+  html += F("</select><button type='submit'>Save</button></form>"
+            "<p><a href='/'>&larr; Back</a></p></body></html>");
+  server.send(200, "text/html; charset=utf-8", html);
+}
+
+void handleSetRadon() {
+  radonInPCi = (server.arg("unit") == "pci");
+  if (server.hasArg("stale")) {
+    int v = server.arg("stale").toInt();
+    if (v >= 1 && v <= 240) radonStaleMin = (uint16_t)v;
+  }
+  String mac = server.arg("mac"); mac.trim();
+  radonTargetMac = mac;
+
+  savePref("rdnpci",   radonInPCi);
+  savePref("rdnstale", radonStaleMin);
+  savePref("rdnmac",   radonTargetMac);
+
+  radonSelectActive();   // re-pick with the new target / staleness window
+
+  server.sendHeader("Location", "/radon", true);
+  server.send(303, "text/plain", "Saved");
+}
+
 void doFRCSerial(uint16_t target) {
   if (target < 350 || target > 2000) {
     Serial.println("FRC target must be 350-2000 ppm");
@@ -3215,6 +3845,35 @@ void wifiStatusSerial() {
   } else {
     Serial.println("Not connected");
   }
+}
+
+void bleStatusSerial() {
+  radonAgeOutDevices();
+  Serial.printf("BLE scanner: %s%s\n", bleReady ? "ready" : "off",
+                bleScanning ? " (scanning)" : "");
+  Serial.printf("Selected: %s\n",
+                radonAvailable()
+                  ? (radonSrcName.length() ? radonSrcName.c_str() : radonSrcMac.c_str())
+                  : "(none / stale)");
+  if (radonAvailable()) {
+    Serial.printf("  radon=%u Bq/m3 (%.1f pCi/L)  battery=%u%%  age=%lus\n",
+                  currentRadonBq, currentRadonBq / BQ_PER_PCIL, radonBattery,
+                  (millis() - lastRadonRxMs) / 1000UL);
+  }
+  Serial.printf("Target: %s   stale=%u min\n",
+                radonTargetMac.length() ? radonTargetMac.c_str() : "auto (strongest)",
+                radonStaleMin);
+  Serial.println("Seen devices:");
+  bool any = false;
+  for (int i = 0; i < BLE_MAX_DEVICES; i++) {
+    if (!bleSeen[i].used) continue;
+    any = true;
+    Serial.printf("  %-17s %-16s rssi=%d radon=%u Bq batt=%u%% age=%lus\n",
+                  bleSeen[i].mac, bleSeen[i].name[0] ? bleSeen[i].name : "(unnamed)",
+                  bleSeen[i].rssi, bleSeen[i].radonBq, bleSeen[i].battery,
+                  (millis() - bleSeen[i].lastSeenMs) / 1000UL);
+  }
+  if (!any) Serial.println("  (none in range)");
 }
 
 // ============================================================
@@ -3290,6 +3949,13 @@ void printInfo() {
     Serial.printf("MQTT broker: %s:%u\n", mqttHost.c_str(), (unsigned)mqttPort);
     Serial.printf("MQTT topic:  %s\n", mqttTopicPrefix.c_str());
   }
+  if (radonAvailable()) {
+    Serial.printf("Radon:       %u Bq/m3 (%.1f pCi/L) batt %u%% from %s ('ble-status' for more)\n",
+                  currentRadonBq, currentRadonBq / BQ_PER_PCIL, radonBattery,
+                  radonSrcName.length() ? radonSrcName.c_str() : radonSrcMac.c_str());
+  } else {
+    Serial.println("Radon:       none (no fresh Aranet Rn advertisement)");
+  }
 }
 
 void handleSerialCommands() {
@@ -3305,12 +3971,13 @@ void handleSerialCommands() {
   else if (lower == "wifi-setup")      { if (!wifiPortalActive) startWifiPortal(); }
   else if (lower == "wifi-reset")      wifiResetSerial();
   else if (lower == "wifi-status")     wifiStatusSerial();
+  else if (lower == "ble-status")      bleStatusSerial();
   else if (lower == "info")            printInfo();
   else if (lower == "reset")           resetPrefs();
   else if (lower == "erase-log")       eraseLog();
   else Serial.println("Commands: 'frc <ppm>', 'asc on/off', "
                       "'wifi-setup', 'wifi-reset', 'wifi-status', "
-                      "'info', 'reset', 'erase-log'");
+                      "'ble-status', 'info', 'reset', 'erase-log'");
 }
 
 // ============================================================
@@ -3366,6 +4033,10 @@ void setup() {
 
   tryWifiConnect();
 
+  // BLE radon scanner. Brought up after WiFi so the radio's software
+  // coexistence is already initialised; scans run periodically in loop().
+  setupBle();
+
   drawMainScreen();
   Serial.println("Ready. 'info' for status.");
 }
@@ -3387,6 +4058,7 @@ void loop() {
   serviceNtp();
   serviceAutoBrightness();
   serviceMqtt();
+  serviceBleScan();
 
   // Tick the clock once a second on the main screen.
   // Also redraw the date row when the date changes (or just became
@@ -3407,14 +4079,24 @@ void loop() {
 
   if (now - lastReadTime >= READ_INTERVAL_MS) {
     lastReadTime = now;
-    if (readSensor() && isMainScreen) drawReadings();
+    bool fresh = readSensor();
+    bool radNow = radonAvailable();
+    // Redraw on a new sensor reading, or when radon (dis)appeared so the
+    // bottom row reflows between 2- and 3-column layouts.
+    if (isMainScreen && (fresh || radNow != radonShownLast)) {
+      // If we were viewing the radon graph and it went stale, redraw the
+      // graph too (drawGraph falls back to CO2).
+      if (!radNow && graphMode == GM_RADON) drawGraph();
+      drawReadings();
+    }
   }
 
   if (dataValid &&
       (lastSampleTime == 0 || now - lastSampleTime >= SAMPLE_INTERVAL_MS)) {
     lastSampleTime = now;
-    addGraphSample(currentCO2, currentTemp, currentRH);
-    appendLog(currentCO2, currentTemp, currentRH);
+    uint16_t radonSample = radonAvailable() ? currentRadonBq : RADON_NONE;
+    addGraphSample(currentCO2, currentTemp, currentRH, radonSample);
+    appendLog(currentCO2, currentTemp, currentRH, radonSample);
     if (isMainScreen) {
       drawGraph();
       drawReadings();   // refresh trend arrow

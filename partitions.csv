@@ -1,0 +1,22 @@
+# Custom 4 MB partition table for the CYD CO2/Radon monitor.
+#
+# The stock "Default 4MB with spiffs" table (default.csv) gives 1.25 MB app
+# slots, which the BLE (NimBLE) build overflows. This table grows each OTA
+# app slot to 1.5 MB (0x180000) and shrinks the LittleFS data partition to
+# ~0.94 MB (0xF0000). Dual-OTA is preserved (app0 + app1) so ElegantOTA still
+# works for future updates; only the one-time switch TO this table needs a
+# USB flash.
+#
+# Layout (ends exactly at 0x400000 = 4 MB):
+#   nvs      0x009000  0x005000   (WiFiManager creds + co2mon settings/cache)
+#   otadata  0x00e000  0x002000
+#   app0     0x010000  0x180000   1.5 MB
+#   app1     0x190000  0x180000   1.5 MB
+#   spiffs   0x310000  0x0F0000   ~0.94 MB LittleFS (/co2log.bin ring)
+#
+# Name,   Type, SubType, Offset,   Size,     Flags
+nvs,      data, nvs,     0x9000,   0x5000,
+otadata,  data, ota,     0xe000,   0x2000,
+app0,     app,  ota_0,   0x10000,  0x180000,
+app1,     app,  ota_1,   0x190000, 0x180000,
+spiffs,   data, spiffs,  0x310000, 0xF0000,

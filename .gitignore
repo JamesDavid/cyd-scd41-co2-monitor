@@ -1,4 +1,7 @@
-# Arduino IDE build output
+# PlatformIO build output
+.pio/
+
+# Arduino IDE build output (legacy)
 cyd_scd41_co2_monitor_portrait/build/
 
 # Exported compiled binaries
@@ -6,6 +9,9 @@ cyd_scd41_co2_monitor_portrait/build/
 *.ino.bin
 *.ino.elf
 *.ino.map
+
+# Editor / IDE
+.vscode/
 
 # Claude Code local-only settings
 .claude/settings.local.json

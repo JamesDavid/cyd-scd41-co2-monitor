@@ -1,6 +1,6 @@
 # CYD CO2 Monitor
 
-An indoor air quality monitor built on the ESP32-2432S028R ("Cheap Yellow Display") with a Sensirion SCD41 CO2 sensor. Shows live CO2, temperature, and humidity on the touchscreen, logs samples to flash for ~400 days of history, serves a web dashboard with three Chart.js graphs and CSV export, and optionally publishes to MQTT for Home Assistant / Node-RED.
+An indoor air quality monitor built on the ESP32-2432S028R ("Cheap Yellow Display") with a Sensirion SCD41 CO2 sensor. Shows live CO2, temperature, and humidity on the touchscreen, logs samples to flash for ~9 months of history, serves a web dashboard with Chart.js graphs and CSV export, and optionally publishes to MQTT for Home Assistant / Node-RED. Can also passively sniff an **Aranet Rn** radon detector over Bluetooth and surface radon as a fourth metric.
 
 ## Bill of Materials
 
@@ -36,8 +36,11 @@ Install via the Arduino IDE Library Manager:
 | WiFiManager | tzapu (tablatronix) | 2.0.17 or later. Captive-portal WiFi setup. |
 | ElegantOTA | Ayush Sharma | 3.x series. Web-form firmware update at `/update`. |
 | PubSubClient | Nick O'Leary | MQTT client. |
+| NimBLE-Arduino | h2zero | 1.4.x. Passive BLE sniffing of the Aranet Rn radon detector. |
 
 The ESP32 board package itself ships with `WiFi.h`, `WebServer.h`, `ESPmDNS.h`, `Preferences.h`, `LittleFS.h` — no separate install needed.
+
+> This repo is now a **PlatformIO** project (`platformio.ini` + `partitions.csv`); the library versions and the TFT_eSPI configuration are pinned there, so the Arduino-IDE Library-Manager steps above are only needed if you build in the IDE instead. Build with `pio run -e usb`, flash with `pio run -e usb -t upload`.
 
 ## Hardware wiring
 
@@ -49,8 +52,22 @@ The CYD has a "Temp/Humidity" connector with the silkscreen labels **3V3 / GND /
 2. Updates on-screen readings on each successful read.
 3. Every 5 minutes, captures a sample to a 60-entry in-RAM ring buffer (drives the on-device graph) and appends a fully-timestamped record to a flash log.
 4. Renders a touch-driven UI: settings (altitude, temp offset, calibration), time settings (timezone, 12/24h, NTP), 24-hour stats screen, forced-calibration confirmation, WiFi setup via captive portal.
-5. When connected to WiFi, runs a web server with three Chart.js plots (CO2, temperature, humidity), a JSON endpoint, CSV download, MQTT configuration page, and OTA firmware update at `/update`.
+5. When connected to WiFi, runs a web server with Chart.js plots (CO2, temperature, humidity, and radon when present), a JSON endpoint, CSV download, MQTT configuration page, and OTA firmware update at `/update`.
 6. Optionally publishes to MQTT every 30 seconds with Home Assistant auto-discovery.
+7. Optionally sniffs an **Aranet Rn** radon detector over BLE (see below).
+
+## Radon (Aranet Rn over Bluetooth)
+
+If you own an [Aranet Rn](https://aranet.com) radon detector and enable **Smart Home Integration** mode in the Aranet app, it broadcasts its latest reading in a BLE advertisement. This firmware passively sniffs that advertisement (no pairing) and treats radon as a fourth metric:
+
+- The bottom row of the main screen becomes **Temp | RH | Radon** while a fresh reading is present, and falls back to **Temp | RH** when the Aranet is out of range or the reading goes stale.
+- Tap the radon number to toggle **Bq/m³ ↔ pCi/L**. Radon joins the tappable graph cycle (CO2 → Temp → RH → Radon).
+- A low-battery marker appears by the radon value when the Aranet battery is low.
+- Radon flows into `/data.json`, `/history.csv` (`radon_bqm3` column), `/history.json`, the web dashboard chart, and MQTT (a `Radon` and a `Radon Battery` entity auto-discover in Home Assistant).
+- Only the **current** reading is broadcast — the 7d/30d/90d averages in the Aranet app are computed in the cloud and are not available over BLE.
+- Configure the staleness timeout, default units, and (if you have several Aranet Rn units) pin a specific one by MAC at **`/radon`**. The `ble-status` serial command lists every Aranet Rn it can hear. Radon samples are stored in Bq/m³; only the display/JSON honor the unit toggle (the CSV stays Bq/m³, mirroring temperature staying Celsius).
+
+No extra wiring — the ESP32's built-in radio does both WiFi and BLE (a short passive/active scan runs about once a minute).
 
 ## On-device UI
 
@@ -134,12 +151,14 @@ When WiFi is connected:
 
 | Endpoint | Returns |
 |---|---|
-| `/` | HTML status page with three Chart.js plots (CO2, temperature, humidity) and live readings; refreshes every 60s |
-| `/data.json` | Current readings + settings as JSON |
-| `/history.json?n=288` | Recent N samples for the charts (default 288 = 24h); includes CO2, temp in current unit, and RH |
-| `/history.csv` | Full log as CSV (timestamp, CO2, temp, RH), streamed in chunks |
+| `/` | HTML status page with Chart.js plots (CO2, temperature, humidity, and radon when present) and live readings; refreshes every 60s |
+| `/data.json` | Current readings + settings as JSON (radon fields included when a fresh reading exists) |
+| `/history.json?n=288` | Recent N samples for the charts (default 288 = 24h); includes CO2, temp in current unit, RH, and radon (`null` where absent) |
+| `/history.csv` | Full log as CSV (`timestamp_utc,co2_ppm,temp_c,rh_pct,radon_bqm3`), streamed in chunks |
 | `/mqtt` | MQTT configuration form with live connection status |
 | `/setmqtt` (POST) | Saves MQTT settings |
+| `/radon` | Radon (Aranet Rn) settings: units, staleness timeout, target-device picker; lists every Aranet Rn heard |
+| `/setradon` (POST) | Saves radon settings |
 | `/sethostname` (POST) | Updates the mDNS hostname |
 | `/update` | ElegantOTA firmware update form |
 
@@ -156,34 +175,42 @@ The MQTT client (PubSubClient under the hood) publishes every 30 seconds when en
 | `{prefix}/temp_f` | float Fahrenheit |
 | `{prefix}/rh` | float % humidity |
 | `{prefix}/status` | `good` / `moderate` / `poor` / `verypoor` |
+| `{prefix}/radon` | integer Bq/m³ (only when a fresh Aranet Rn reading exists) |
+| `{prefix}/radon_battery` | Aranet battery % (only when fresh) |
 | `{prefix}/state` | JSON with all of the above (for HA) |
 
-If Home Assistant auto-discovery is enabled (it is by default), the device publishes its config to `homeassistant/sensor/{node}/{co2,temp,rh}/config` on connect. HA picks up the device automatically, exposing one device with three sensor entities. Temperature units track the on-device F/C setting.
+If Home Assistant auto-discovery is enabled (it is by default), the device publishes its config to `homeassistant/sensor/{node}/{co2,temp,rh,radon,radon_batt}/config` on connect. HA picks up the device automatically, exposing one device with up to five sensor entities. Temperature units track the on-device F/C setting; radon is always reported in Bq/m³ over MQTT.
 
 Configure via the `/mqtt` page on the web dashboard.
 
 ## Build
 
-Arduino IDE 1.8.x or 2.x with the **esp32 by Espressif Systems** core (2.x series) installed.
+### PlatformIO (recommended)
 
-TFT_eSPI is configured globally via its `User_Setup.h`. Paste the block in the sketch header into `Documents/Arduino/libraries/TFT_eSPI/User_Setup.h`, replacing whatever's there.
+```
+pio run -e usb            # compile
+pio run -e usb -t upload  # flash over USB
+pio device monitor        # serial console @115200
+```
 
-Tools menu:
+Everything is pinned in `platformio.ini`: the `espressif32 @ 6.9.0` platform (arduino-esp32 2.0.x), all library versions, the TFT_eSPI configuration (via `build_flags`, so no global `User_Setup.h` edit is needed), and the custom partition table (`partitions.csv`).
 
-- Board: **ESP32 Dev Module**
-- Partition Scheme: **Default 4MB with spiffs (1.2MB APP/1.5MB SPIFFS)** — the SPIFFS partition is what LittleFS uses
-- Flash Size: **4MB (32Mb)**
-- Flash Frequency: 80 MHz
-- Flash Mode: QIO (or DIO if QIO won't boot)
-- Upload Speed: 921600
+**The radon build needs a custom partition table.** Adding the BLE (NimBLE) stack pushes the firmware past the stock 1.25 MB app slot, so `partitions.csv` grows each OTA app slot to 1.5 MB and shrinks LittleFS to ~0.94 MB (still ~277 days / ~9 months of 5-minute samples). Consequences:
 
-After the first flash, OTA updates work via `http://co2monitor-XXXXXX.local/update` (using your device's actual hostname). Sketch → Export Compiled Binary in the Arduino IDE produces a `.bin` to upload.
+- **A partition-table change can only be applied over USB.** Flashing this version onto a device running an older build requires one USB flash; `/history.csv` should be downloaded first because the new layout resets the on-flash log.
+- **OTA still works for every future update.** Dual-OTA is preserved (two 1.5 MB slots) and the ~1.4 MB firmware fits, so `http://co2monitor-XXXXXX.local/update` behaves exactly as before once the new partitioning is in place.
+
+### Arduino IDE (alternative)
+
+Still buildable as a single `.cpp`/`.ino` in the IDE 1.8.x/2.x with the esp32 2.x core, but you must do it the manual way: paste the TFT_eSPI block from the sketch header into `Documents/Arduino/libraries/TFT_eSPI/User_Setup.h`, install NimBLE-Arduino, set Board **ESP32 Dev Module**, and select a custom partition CSV matching `partitions.csv` (the stock "Default 4MB with spiffs" is too small).
 
 ## Files in this project
 
 | File | Purpose |
 |---|---|
-| `cyd_scd41_co2_monitor_portrait.ino` | Main sketch |
+| `src/cyd_scd41_co2_monitor_portrait.cpp` | Main firmware (single file) |
+| `platformio.ini` | PlatformIO build config (platform, libraries, TFT_eSPI flags) |
+| `partitions.csv` | Custom 4 MB partition table (1.5 MB dual-OTA app + ~0.94 MB LittleFS) |
 | `cyd_desk_stand.scad` | Parametric OpenSCAD enclosure (two-piece: front + L-shaped back) |
 | `README.md` | This file |
 | `cyd.md` | Notes on programming the CYD board |
