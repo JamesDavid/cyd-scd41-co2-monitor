@@ -17,6 +17,14 @@ cyd_scd41_co2_monitor_portrait/build/
 # Editor / IDE
 .vscode/
 
+# Local data backups / stray artifacts (not project source)
+# - downloaded /history.csv backups (often date-prefixed)
+*co2_history*.csv
+# - voice/audio scratch files
+*.wav
+# - stray root-level dup of 3D_Printed_Case/Aura+-+Case+with+Smooth+Front.3mf
+/Aura+-+Case+with+Smooth+Front.3mf
+
 # Claude Code local-only settings
 .claude/settings.local.json
 
