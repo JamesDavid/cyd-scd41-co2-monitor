@@ -2,6 +2,18 @@
 
 An indoor air quality monitor built on the ESP32-2432S028R ("Cheap Yellow Display") with a Sensirion SCD41 CO2 sensor. Shows live CO2, temperature, and humidity on the touchscreen, logs samples to flash for ~9 months of history, serves a web dashboard with Chart.js graphs and CSV export, and optionally publishes to MQTT for Home Assistant / Node-RED. Can also passively sniff an **Aranet Rn** radon detector over Bluetooth and surface radon as a fourth metric.
 
+## ⚡ Flash it from your browser
+
+No toolchain needed — flash a pre-built binary straight from Chrome/Edge/Opera with the web installer:
+
+### 👉 **https://jamesdavid.github.io/cyd-scd41-co2-monitor/**
+
+Plug the CYD into your computer with a data USB cable, click **Connect & Flash**, and pick the serial port. (Web Serial is desktop Chrome / Edge / Opera only; Firefox and Safari can't do USB flashing.) After this one USB flash, future updates go over the air at `http://<device>.local/update`.
+
+> **Heads-up:** this build changes the flash partition table (to make room for Bluetooth), so it must be flashed over USB once and it **resets the on-device history log**. If you're upgrading an existing unit, download `http://<device>.local/history.csv` first. Settings survive.
+
+To build from source instead, see [Build](#build) below.
+
 ## Bill of Materials
 
 ### Amazon
@@ -200,6 +212,18 @@ Everything is pinned in `platformio.ini`: the `espressif32 @ 6.9.0` platform (ar
 - **A partition-table change can only be applied over USB.** Flashing this version onto a device running an older build requires one USB flash; `/history.csv` should be downloaded first because the new layout resets the on-flash log.
 - **OTA still works for every future update.** Dual-OTA is preserved (two 1.5 MB slots) and the ~1.4 MB firmware fits, so `http://co2monitor-XXXXXX.local/update` behaves exactly as before once the new partitioning is in place.
 
+### Updating the web flasher
+
+The browser flasher under `docs/` serves pre-built binaries. After a release build, refresh them and bump the version in `docs/manifest.json`:
+
+```
+pio run -e usb
+cp .pio/build/usb/{bootloader,partitions,firmware}.bin docs/firmware/
+cp ~/.platformio/packages/framework-arduinoespressif32/tools/partitions/boot_app0.bin docs/firmware/
+```
+
+The ESP32 flash offsets in `docs/manifest.json` are `0x1000` bootloader, `0x8000` partitions, `0xe000` boot_app0, `0x10000` app.
+
 ### Arduino IDE (alternative)
 
 Still buildable as a single `.cpp`/`.ino` in the IDE 1.8.x/2.x with the esp32 2.x core, but you must do it the manual way: paste the TFT_eSPI block from the sketch header into `Documents/Arduino/libraries/TFT_eSPI/User_Setup.h`, install NimBLE-Arduino, set Board **ESP32 Dev Module**, and select a custom partition CSV matching `partitions.csv` (the stock "Default 4MB with spiffs" is too small).
@@ -211,6 +235,7 @@ Still buildable as a single `.cpp`/`.ino` in the IDE 1.8.x/2.x with the esp32 2.
 | `src/cyd_scd41_co2_monitor_portrait.cpp` | Main firmware (single file) |
 | `platformio.ini` | PlatformIO build config (platform, libraries, TFT_eSPI flags) |
 | `partitions.csv` | Custom 4 MB partition table (1.5 MB dual-OTA app + ~0.94 MB LittleFS) |
+| `docs/` | GitHub Pages web flasher: `index.html` + `manifest.json` + `firmware/*.bin` (ESP Web Tools) |
 | `cyd_desk_stand.scad` | Parametric OpenSCAD enclosure (two-piece: front + L-shaped back) |
 | `README.md` | This file |
 | `cyd.md` | Notes on programming the CYD board |

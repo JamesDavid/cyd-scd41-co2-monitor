@@ -10,6 +10,10 @@ cyd_scd41_co2_monitor_portrait/build/
 *.ino.elf
 *.ino.map
 
+# Firmware binaries served by the GitHub Pages web flasher MUST stay tracked.
+# (Keep this negation below any *.bin ignore rule that might be added later.)
+!docs/firmware/*.bin
+
 # Editor / IDE
 .vscode/
 

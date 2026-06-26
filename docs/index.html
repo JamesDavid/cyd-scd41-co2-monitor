@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>CYD CO2 / Radon Monitor — Web Flasher</title>
+  <script type="module"
+          src="https://unpkg.com/esp-web-tools@10/dist/web/install-button.js?module"></script>
+  <style>
+    :root { color-scheme: dark; }
+    body {
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: #111; color: #eee; margin: 0;
+      padding: 32px 20px; max-width: 720px; margin-inline: auto; line-height: 1.5;
+    }
+    h1 { margin: 0 0 4px; font-size: 1.6em; }
+    h2 { margin: 28px 0 8px; font-size: 1.15em; color: #bbb;
+         border-bottom: 1px solid #333; padding-bottom: 6px; }
+    .sub { color: #888; margin: 0 0 24px; }
+    .flash { text-align: center; margin: 28px 0; }
+    .note { background: #1a1a1a; border-left: 3px solid #fa3;
+            padding: 10px 14px; border-radius: 4px; margin: 14px 0; }
+    .ok { border-left-color: #5c5; }
+    code { background: #222; padding: 2px 6px; border-radius: 3px; font-size: .92em; }
+    a { color: #9cf; }
+    ul { padding-left: 20px; }
+    li { margin: 4px 0; }
+    .browser { color: #888; font-size: .9em; text-align: center; }
+    footer { margin-top: 40px; color: #555; font-size: .85em; text-align: center; }
+    esp-web-install-button { --esp-tools-button-color: #cef;
+                             --esp-tools-button-text-color: #16273d; }
+  </style>
+</head>
+<body>
+  <h1>CYD CO2 / Radon Monitor</h1>
+  <p class="sub">Browser firmware flasher for the ESP32-2432S028R "Cheap Yellow Display"
+     build (v1.7.0, with Aranet&nbsp;Rn radon support).</p>
+
+  <div class="flash">
+    <esp-web-install-button manifest="./manifest.json">
+      <button slot="activate"
+              style="font-size:1.1em;padding:12px 28px;border:0;border-radius:6px;
+                     background:#2a4060;color:#cef;cursor:pointer">
+        Connect &amp; Flash
+      </button>
+      <span slot="unsupported">
+        Your browser can't flash over USB. Use desktop
+        <b>Chrome</b>, <b>Edge</b>, or <b>Opera</b>.
+      </span>
+      <span slot="not-allowed">
+        Web Serial needs a secure (HTTPS) connection — you should be on it here.
+      </span>
+    </esp-web-install-button>
+  </div>
+  <p class="browser">Requires desktop Chrome / Edge / Opera (Web Serial API). Firefox and Safari are not supported.</p>
+
+  <h2>How to flash</h2>
+  <ol>
+    <li>Plug the CYD into this computer with a <b>data</b> USB cable (not charge-only).</li>
+    <li>Click <b>Connect &amp; Flash</b> and pick the device's serial port
+        (often labelled <code>CP2102</code> / <code>CH340</code> / <code>USB-Serial</code>).
+        If nothing appears, install the
+        <a href="https://www.silabs.com/developer-tools/usb-to-uart-bridge-vcp-drivers">CP210x</a>
+        or <a href="https://www.wch-ic.com/downloads/CH341SER_EXE.html">CH340</a> driver.</li>
+    <li>When prompted, choose <b>Erase device</b> for a clean first install
+        (recommended — see the warning below), then confirm.</li>
+    <li>After flashing, the monitor boots. To join WiFi, tap the CO2 number →
+        the WiFi tile, then connect your phone to the
+        <code>CO2-Monitor-Setup-XXXXXX</code> access point and pick your network.</li>
+  </ol>
+
+  <div class="note">
+    <b>This version changes the flash partition table</b> (to make room for Bluetooth).
+    That's why it must be flashed over USB once — a partition change can't be done over
+    the air. <b>It also resets the on-device long-term log.</b> If you're upgrading an
+    existing unit and want to keep your history, first download
+    <code>http://&lt;device&gt;.local/history.csv</code> while it's still on the old
+    firmware. Your settings (and the recent on-screen graph) are preserved.
+  </div>
+
+  <div class="note ok">
+    <b>After this one USB flash, future updates work over the air</b> at
+    <code>http://&lt;device&gt;.local/update</code> — dual-OTA is preserved.
+  </div>
+
+  <h2>What's in this build</h2>
+  <ul>
+    <li>Live CO2, temperature, and humidity from a Sensirion SCD41, with ~9 months of on-flash history.</li>
+    <li>Touch UI, a WiFi web dashboard with Chart.js graphs + CSV export, and MQTT / Home Assistant auto-discovery.</li>
+    <li><b>Aranet&nbsp;Rn radon</b> over Bluetooth (Smart Home Integration mode): on-screen
+        radon readout, a radon graph, and radon in the CSV / JSON / web / MQTT.</li>
+  </ul>
+
+  <footer>
+    Source &amp; docs:
+    <a href="https://github.com/JamesDavid/cyd-scd41-co2-monitor">github.com/JamesDavid/cyd-scd41-co2-monitor</a>
+    · firmware v1.7.0
+  </footer>
+</body>
+</html>
